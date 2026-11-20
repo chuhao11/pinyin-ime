@@ -55,9 +55,12 @@ pub fn effective(freq: f64, last: i64, now: i64) -> f64 {
     freq * 0.5f64.powf(dt / HALF_LIFE_SECS)
 }
 
-/// 记忆加分：用过一次且是最近，加分足够让它排第一；随时间衰减。
+/// 词的记忆加分：选一次约 +3.5，三次约 +5，十次约 +7.3；随时间衰减。
+/// 一次就足够让人名、菜名这种没有常用竞争对手的词排第一；
+/// 但偶尔选一次的冷门词（世情、是青）不会挤掉很常用的词（事情），而是放进前 4 个（见 lattice.rs 的"上次选过的"）；
+/// 选三次左右才排第一。
 pub fn bonus(eff: f64) -> f32 {
-    (25.0 * eff.min(1.0) + 3.0 * (1.0 + eff).ln()) as f32
+    (2.0 * eff.min(1.0) + 2.2 * (1.0 + eff).ln()) as f32
 }
 
 #[derive(Default)]
@@ -382,6 +385,15 @@ impl UserDb {
 
     // ---- 单字 ----
 
+    /// 上次选这个字（词）是什么时候。
+    pub fn last_pick(&self, code: &[u16], text: &str) -> Option<i64> {
+        if code.len() == 1 && text.chars().count() == 1 {
+            self.chars.get(&(code[0], text.to_string())).map(|x| x.1)
+        } else {
+            self.lookup(code, text).map(|e| e.last)
+        }
+    }
+
     /// 单字的记忆加分（很小，要选几十次才会换位置）。
     pub fn char_bonus(&self, syl: u16, text: &str, now: i64) -> f32 {
         self.chars.get(&(syl, text.to_string())).map(|&(f, l)| char_bonus(effective(f, l, now))).unwrap_or(0.0)
@@ -585,7 +597,7 @@ mod tests {
         u.learn(&d, &code, "张子涵", 1000);
         u.learn(&d, &[d.syllable_id("shi").unwrap()], "事", 1000);
         assert_eq!(u.len(), 1);
-        assert!(u.bonus(&code, "张子涵", 1000) > 20.0);
+        assert!(u.bonus(&code, "张子涵", 1000) > 3.0);
         // 一年后加分明显变小，但还在
         let later = u.bonus(&code, "张子涵", 1000 + 365 * 86400);
         assert!(later > 0.0 && later < 5.0, "{later}");

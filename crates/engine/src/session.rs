@@ -657,7 +657,7 @@ mod tests {
         add("a", "啊", -5.0);
         // 让 xian 有 30 个以上的候选，测试矩阵翻页
         for i in 0..40 {
-            add("xian", &format!("先{i}"), -6.0 - i as f32 * 0.01);
+            add("xian", &format!("先{i}"), -6.0 - i as f32 * 0.3);
         }
         add("xi an", "西安", -9.0);
         let d = Dict::from_bytes(b.build()).unwrap();
@@ -897,6 +897,25 @@ mod tests {
         assert_eq!(key(&mut m, Key::Char(',')), Response::pass());
         typ(&mut m, "ba");
         assert_eq!(m.view().items[0], "把");
+    }
+
+    #[test]
+    fn last_pick_far_back_comes_to_front_four() {
+        let mut m = ime();
+        // xian 有 40 多个候选；从矩阵里选第 20 个
+        typ(&mut m, "xian");
+        let first = m.view().items[0].clone();
+        let want = m.candidates()[20].text.clone();
+        key(&mut m, Key::Char('-'));
+        while m.view().page * 25 + m.view().highlight < 20 {
+            key(&mut m, Key::Right);
+        }
+        assert_eq!(key(&mut m, Key::Space).commit, Some(want.clone()));
+        // 下次：第一个不变，选过的那个在前 4 个里
+        typ(&mut m, "xian");
+        let row = m.view().items;
+        assert_eq!(row[0], first);
+        assert!(row.iter().take(4).any(|t| *t == want), "{want} 不在前 4 个：{row:?}");
     }
 
     #[test]

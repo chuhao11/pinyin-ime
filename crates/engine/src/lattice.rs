@@ -30,7 +30,7 @@ const POOR_GAP: f32 = 10.0;
 const WEAK_WORD_GAP: f32 = 4.0;
 const WEAK_VS_PARTIAL_GAP: f32 = 5.0;
 /// 用户自己造的、词库里没有的词的基础分。
-const USER_BASE: f32 = -12.0;
+const USER_BASE: f32 = -14.0;
 /// 拼整句时，记忆加分最多算这么多（否则一个记住的词会把整句拉歪）。
 const DP_BONUS_CAP: f32 = 4.0;
 /// 候选总数上限。
@@ -59,6 +59,10 @@ const EN_PRIOR_VALID_PINYIN: f32 = -3.0;
 /// 你自己打过、词表里没有的英文词的基础分。
 const EN_USER_BASE: f32 = -11.0;
 const MAX_EN: usize = 8;
+/// 上次选过、但现在排在第 4 个以后的字词，挪到第 4 个（候选条至少显示 4 个，一眼能看到）。
+const RECENT_SLOT: usize = 3;
+/// 多久以内选过的才算"上次选过"。
+const RECENT_SECS: i64 = 60 * 86400;
 /// 一个词里最多纠正几处。
 const MAX_FIXES_PER_WORD: usize = 1;
 
@@ -780,9 +784,26 @@ pub fn analyze_with(q: &Query, input: &str) -> Vec<Candidate> {
 
     out.extend(tail);
     out.extend(part_poor);
-    // 去重（保留排在前面的），限制总数
+    // 去重（保留排在前面的）
     let mut seen = HashSet::new();
     out.retain(|c| seen.insert(c.text.clone()));
+    // 上次选过、但排得靠后的字词：放进前 4 个。第一个仍然是常用的，要选很多次才会换
+    let recent = out
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| matches!(c.kind, CandKind::Word | CandKind::Sentence) && !c.code.is_empty())
+        .filter_map(|(i, c)| user.last_pick(&c.code, &c.text).filter(|&t| now - t <= RECENT_SECS).map(|t| (i, t)))
+        .max_by_key(|&(_, t)| t);
+    if let Some((i, _)) = recent {
+        if i > RECENT_SLOT {
+            let mut c = out.remove(i);
+            c.poor = false;
+            out.insert(RECENT_SLOT, c);
+            for x in out.iter_mut().take(RECENT_SLOT) {
+                x.poor = false;
+            }
+        }
+    }
     out.truncate(MAX_CANDS);
     out
 }

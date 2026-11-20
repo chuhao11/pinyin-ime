@@ -288,6 +288,33 @@ fn learned_word_does_not_hide_others() {
     }
 }
 
+/// 选过一次的冷门词：第一个仍是常用词，冷门词放进前 4 个，下次一眼能看到。
+#[test]
+fn rare_pick_goes_to_front_four_not_first() {
+    let Some(mut ime) = common::real_ime(UserDb::in_memory()) else { return };
+    let mut checked = 0;
+    for input in ["shiqing", "zhidao", "keyi", "shijian", "dongxi", "xianzai", "shi", "yi", "de"] {
+        typ(&mut ime, input);
+        let first = ime.view().items[0].clone();
+        // 选一个排在第 10 个以后、同样把输入全对上的候选
+        let n = ime.candidates().len();
+        let Some(i) = (10..n).find(|&i| ime.candidates()[i].consumed == ime.candidates()[0].consumed) else {
+            esc(&mut ime);
+            continue;
+        };
+        let want = ime.candidates()[i].text.clone();
+        assert_eq!(pick(&mut ime, &want).as_deref(), Some(want.as_str()));
+        ime.clear_context();
+        typ(&mut ime, input);
+        let row = ime.view().items;
+        assert_eq!(row[0], first, "{input}：选了一次「{want}」，第一个不该变");
+        assert!(row.iter().take(4).any(|t| *t == want), "{input}：「{want}」不在前 4 个：{row:?}");
+        esc(&mut ime);
+        checked += 1;
+    }
+    assert!(checked >= 5);
+}
+
 /// 首选总被冷落（你一直选别的），3 次以后它被删掉。
 #[test]
 fn ignored_first_choice_is_deleted() {
