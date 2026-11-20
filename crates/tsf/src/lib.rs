@@ -3,3 +3,6 @@
 
 pub use pinyin_ipc;
 pub use pinyin_types;
+
+#[cfg(windows)]
+pub use windows;
