@@ -401,5 +401,46 @@ fn run() -> Result<(), String> {
         fs::write(report, md).map_err(|e| format!("写不了 {}：{e}", report.display()))?;
         println!("清单已写到 {}", report.display());
     }
+    build_english(&args)?;
+    Ok(())
+}
+
+/// 英文词表：雾凇拼音的英文词库（整理过的常用词 + 缩写/互联网词）定词表，
+/// Google 万亿词语料的频率排名定分数（排名 r 的词频率约为 0.1/r）。
+/// 输出 data/build/english.tsv：每行"词<Tab>分数"。
+fn build_english(args: &Args) -> Result<(), String> {
+    let dir = args.raw.join("english");
+    let ranks_text = fs::read_to_string(dir.join("20k.txt")).map_err(|e| format!("读不了 20k.txt：{e}"))?;
+    let mut rank: HashMap<String, usize> = HashMap::new();
+    for (i, w) in ranks_text.lines().enumerate() {
+        let w = w.trim().to_ascii_lowercase();
+        if !w.is_empty() {
+            rank.entry(w).or_insert(i + 1);
+        }
+    }
+    let mut words: Vec<(String, f64)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for f in ["en.dict.yaml", "en_ext.dict.yaml"] {
+        for r in read_rime(&dir.join(f))? {
+            let w = r[0].trim();
+            // 只要纯字母的词（输入框里打不出空格和横杠）；单个字母不要（除了 I）
+            if w.is_empty() || !w.bytes().all(|b| b.is_ascii_alphabetic()) || (w.len() == 1 && w != "I") {
+                continue;
+            }
+            if !seen.insert(w.to_string()) {
+                continue;
+            }
+            let r = rank.get(&w.to_ascii_lowercase()).copied().unwrap_or(25_000);
+            words.push((w.to_string(), (0.1 / r as f64).ln()));
+        }
+    }
+    words.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut out = String::new();
+    for (w, sc) in &words {
+        let _ = writeln!(out, "{w}\t{sc:.3}");
+    }
+    let path = args.out.with_file_name("english.tsv");
+    fs::write(&path, out).map_err(|e| format!("写不了 {}：{e}", path.display()))?;
+    println!("英文词表已生成：{}（{} 个词）", path.display(), words.len());
     Ok(())
 }

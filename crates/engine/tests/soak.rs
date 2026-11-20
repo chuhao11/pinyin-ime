@@ -8,7 +8,7 @@ mod common;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-use pinyin_engine::{Ime, Key, Mods, UserDb};
+use pinyin_engine::{Key, Mods, UserDb};
 
 struct Counting;
 
@@ -55,12 +55,11 @@ impl Rng {
 
 #[test]
 fn memory_stays_flat_over_long_typing() {
-    let Some(dict) = common::real_dict() else { return };
-    let syllables: Vec<String> = dict.syllables().to_vec();
     let mut user = UserDb::in_memory();
     // 上限调小，让淘汰机制在测试里反复触发
     user.set_max_entries(300);
-    let mut ime = Ime::new(dict, user);
+    let Some(mut ime) = common::real_ime(user) else { return };
+    let syllables: Vec<String> = ime.dict().syllables().to_vec();
     let mut clock = 1_800_000_000i64;
     let mut rng = Rng(0x9E3779B97F4A7C15);
 

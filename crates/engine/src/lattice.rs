@@ -1,29 +1,31 @@
 //! 由一串拼音生成候选。
 //!
-//! 1. 把输入切成所有可能的音节片段（pinyin.rs）。
+//! 1. 把输入切成所有可能的音节片段（pinyin.rs），包括打错纠正后的片段。
 //! 2. 从每个位置出发，沿着词库的字典树查出所有能拼上的字词，得到一张"词网"：
 //!    每条边是"从位置 i 到位置 j 可以是这个词"。
-//! 3. 在词网上找分数最高的一条整句（现在用词频，第三步换成语言模型）。
-//! 4. 候选 = 整句 + 正好覆盖全部输入的字词 + 只覆盖开头一部分的字词。
+//! 3. 在词网上找分数最高的若干条整句（现在用词频，第三步换成语言模型）。
+//!    最好的一条当首选，其余的作为"组合"候选（好+胀 这种词库里没有的搭配）。
+//! 4. 英文：输入能对上英文词（完全一样、补全、拼写纠错）时，按分数混进候选。
+//! 5. 排序：整句 → 全部对上的字词 → 组合 → 只对上开头的字词 → 质量差的。
 
 use std::collections::HashSet;
 
 use crate::dict::Dict;
-use crate::pinyin::{skip_apos, tokenize, TokKind, Token};
+use crate::english::{edit_cost, match_case, max_cost, EnglishDict};
+use crate::pinyin::{skip_apos, tokenize, Fix, TokKind, Token};
 use crate::userdb::{self, UserDb};
 
 /// 一个词最多多少个音节。
 pub const MAX_WORD_SYL: usize = 12;
-/// 用声母简拼的音节扣分。
-const PEN_INITIAL: f32 = -1.5;
-/// 末尾没打完的音节扣分（边打边出字，扣得少）。
-const PEN_PARTIAL: f32 = -0.5;
 /// 实在拼不成拼音的字母，原样保留时的扣分。
 const PEN_RAW: f32 = -25.0;
 /// 同样覆盖全部输入时，多音节词每多一个音节的加分（让"西安"能排进 `xian` 的前几位）。
 const MULTI_SYL_BONUS: f32 = 2.5;
 /// 比同组最好的候选差这么多就算"质量太差"，候选条不硬凑。
 const POOR_GAP: f32 = 10.0;
+/// 全部对上的多字词：比最好的词差 4 以上、又比开头单字差 5 以上（比如 nihao 的"拟好"），挪到单字后面。
+const WEAK_WORD_GAP: f32 = 4.0;
+const WEAK_VS_PARTIAL_GAP: f32 = 5.0;
 /// 用户自己造的、词库里没有的词的基础分。
 const USER_BASE: f32 = -12.0;
 /// 拼整句时，记忆加分最多算这么多（否则一个记住的词会把整句拉歪）。
@@ -32,15 +34,41 @@ const DP_BONUS_CAP: f32 = 4.0;
 pub const MAX_CANDS: usize = 200;
 /// 整句不超过这么多字才记进用户词库。
 const LEARN_SENTENCE_MAX: usize = 6;
+/// 拼整句时，每个起点到每个终点留几个词（用来拼出多种组合）；输入短时多留一些。
+const PER_END: usize = 6;
+const PER_END_SHORT: usize = 16;
+const SHORT_INPUT: usize = 12;
+/// 整句保留多少种。
+const K_PATHS: usize = 32;
+/// 组合候选：比最好的整句差不超过这么多、且输入不超过 3 个音节时，放在单字前面，最多这么多个。
+const COMBO_GAP: f32 = 6.0;
+const COMBO_TOP: usize = 3;
+const COMBO_TOP_MAX_SYL: usize = 3;
+/// 再往后一档的组合：差不超过 9、输入不超过 4 个音节时，放在开头几个单字之后（矩阵第一页里能看到）。
+const COMBO_MORE_GAP: f32 = 9.0;
+const COMBO_MORE: usize = 20;
+const COMBO_MORE_MAX_SYL: usize = 4;
+/// 只对上开头的候选，先放这么多个，再放第二档组合。
+const PARTIAL_HEAD: usize = 5;
+/// 英文：你主要打中文，英文先扣分；输入本身就是完整的拼音时再多扣。
+const EN_PRIOR: f32 = -3.0;
+const EN_PRIOR_VALID_PINYIN: f32 = -3.0;
+/// 你自己打过、词表里没有的英文词的基础分。
+const EN_USER_BASE: f32 = -11.0;
+const MAX_EN: usize = 8;
+/// 一个词里最多纠正几处。
+const MAX_FIXES_PER_WORD: usize = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CandKind {
-    /// 整句（由几个词拼成）
+    /// 整句或组合（由几个词拼成）
     Sentence,
     /// 单个字或词
     Word,
     /// 原样的字母
     Raw,
+    /// 英文单词
+    English,
 }
 
 #[derive(Clone, Debug)]
@@ -50,13 +78,40 @@ pub struct Candidate {
     pub consumed: usize,
     /// 拼音（音节编号），用于记忆
     pub code: Vec<u16>,
-    /// 排序分数
+    /// 排序分数（含记忆加分）
     pub score: f32,
+    /// 不含记忆加分的分数（判断"本来该排第一的是谁"）
+    pub base: f32,
     pub kind: CandKind,
-    /// 比同组最好的差太多
+    /// 质量差，候选条到它为止
     pub poor: bool,
     /// 选了以后要不要记住
     pub learnable: bool,
+    /// 这个候选用到的打错纠正
+    pub fixes: Vec<Fix>,
+    /// 打错时你实际打的拼音（都是完整音节时才有），用来记住"这样打错就是想要这个"
+    pub typed_code: Option<Vec<u16>>,
+}
+
+impl Candidate {
+    pub fn corrected(&self) -> bool {
+        !self.fixes.is_empty()
+    }
+
+    fn simple(text: String, consumed: usize, score: f32, kind: CandKind) -> Self {
+        Candidate {
+            text,
+            consumed,
+            code: Vec::new(),
+            score,
+            base: score,
+            kind,
+            poor: false,
+            learnable: false,
+            fixes: Vec::new(),
+            typed_code: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -65,25 +120,39 @@ enum Src {
     User(u32),
 }
 
+/// 一次纠正：在词的第几个音节、改了什么、你打的那个音节是什么。
+type FixAt = (usize, Fix, Option<u16>);
+
 #[derive(Clone, Debug)]
 struct Hit {
     end: usize,
     src: Src,
-    /// 词本身的分数（含简拼扣分）
+    /// 词本身的分数（含简拼、纠错扣分）
     score: f32,
     /// 记忆加分
     bonus: f32,
     code: Vec<u16>,
+    fixes: Vec<FixAt>,
+    /// 全是完整音节、没有纠正
+    exact: bool,
 }
 
 impl Hit {
-    /// 排候选时用：记忆加分全算
     fn rank_score(&self) -> f32 {
         self.score + self.bonus
     }
-    /// 拼整句时用：记忆加分有上限
     fn dp_score(&self) -> f32 {
         self.score + self.bonus.min(DP_BONUS_CAP)
+    }
+    fn typed_code(&self) -> Option<Vec<u16>> {
+        if self.fixes.is_empty() {
+            return None;
+        }
+        let mut c = self.code.clone();
+        for &(i, _, typed) in &self.fixes {
+            c[i] = typed?;
+        }
+        Some(c)
     }
 }
 
@@ -95,39 +164,64 @@ struct Ctx<'a> {
     now: i64,
 }
 
-fn tok_pen(t: &Token) -> f32 {
-    match t.kind {
-        TokKind::Full => 0.0,
-        TokKind::Initial => PEN_INITIAL,
-        TokKind::Partial => PEN_PARTIAL,
+#[derive(Default)]
+struct Walk {
+    code: Vec<u16>,
+    fixes: Vec<FixAt>,
+    soft: usize,
+    inexact: usize,
+}
+
+impl Walk {
+    /// 纠正了"本来就能用的拼音"的，只在多字词里算数
+    fn can_emit(&self) -> bool {
+        !self.code.is_empty() && !(self.soft > 0 && self.code.len() < 2)
+    }
+    fn enter(&mut self, syl: u16, t: &Token) {
+        self.code.push(syl);
+        if t.kind != TokKind::Full {
+            self.inexact += 1;
+        }
+        if let Some(f) = t.fix {
+            self.fixes.push((self.code.len() - 1, f, t.typed));
+            if t.soft {
+                self.soft += 1;
+            }
+        }
+    }
+    fn leave(&mut self, t: &Token) {
+        self.code.pop();
+        if t.kind != TokKind::Full {
+            self.inexact -= 1;
+        }
+        if t.fix.is_some() {
+            self.fixes.pop();
+            if t.soft {
+                self.soft -= 1;
+            }
+        }
+    }
+    fn usable(&self, t: &Token) -> bool {
+        t.fix.is_none() || self.fixes.len() < MAX_FIXES_PER_WORD
     }
 }
 
-/// 沿词库字典树走。`all` 为真时收集节点上的所有字词，否则只要每个节点最好的那个。
-fn dfs_dict(ctx: &Ctx, node: u32, pos: usize, pen: f32, code: &mut Vec<u16>, all: bool, out: &mut Vec<Hit>) {
-    if !code.is_empty() {
-        let ws = ctx.dict.node_words(node);
-        if all {
-            for w in ws {
-                out.push(Hit {
-                    end: pos,
-                    src: Src::Dict(w),
-                    score: ctx.dict.word_score(w) + pen,
-                    bonus: 0.0,
-                    code: code.clone(),
-                });
-            }
-        } else if let Some(w) = ws.clone().next() {
+/// 沿词库字典树走，每个节点最多收 `limit` 个字词。
+fn dfs_dict(ctx: &Ctx, node: u32, pos: usize, pen: f32, w: &mut Walk, limit: usize, out: &mut Vec<Hit>) {
+    if w.can_emit() {
+        for wi in ctx.dict.node_words(node).take(limit) {
             out.push(Hit {
                 end: pos,
-                src: Src::Dict(w),
-                score: ctx.dict.word_score(w) + pen,
+                src: Src::Dict(wi),
+                score: ctx.dict.word_score(wi) + pen,
                 bonus: 0.0,
-                code: code.clone(),
+                code: w.code.clone(),
+                fixes: w.fixes.clone(),
+                exact: w.inexact == 0,
             });
         }
     }
-    if code.len() >= MAX_WORD_SYL {
+    if w.code.len() >= MAX_WORD_SYL {
         return;
     }
     let p = skip_apos(ctx.s, pos);
@@ -135,25 +229,43 @@ fn dfs_dict(ctx: &Ctx, node: u32, pos: usize, pen: f32, code: &mut Vec<u16>, all
         return;
     }
     for t in &ctx.toks[p] {
-        let tp = pen + tok_pen(t);
+        if !w.usable(t) {
+            continue;
+        }
         for e in ctx.dict.child_edges_in(node, t.lo, t.hi) {
-            code.push(ctx.dict.edge_syl(e));
-            dfs_dict(ctx, ctx.dict.edge_node(e), t.end, tp, code, all, out);
-            code.pop();
+            w.enter(ctx.dict.edge_syl(e), t);
+            match t.second {
+                None => dfs_dict(ctx, ctx.dict.edge_node(e), t.end, pen + t.pen, w, limit, out),
+                Some(sec) => {
+                    for e2 in ctx.dict.child_edges_in(ctx.dict.edge_node(e), sec, sec + 1) {
+                        w.code.push(sec);
+                        dfs_dict(ctx, ctx.dict.edge_node(e2), t.end, pen + t.pen, w, limit, out);
+                        w.code.pop();
+                    }
+                }
+            }
+            w.leave(t);
         }
     }
 }
 
 /// 沿用户词库字典树走（用户词库里都是两个字以上的词）。
-fn dfs_user(ctx: &Ctx, node: u32, pos: usize, pen: f32, code: &mut Vec<u16>, out: &mut Vec<Hit>) {
-    if !code.is_empty() {
+fn dfs_user(ctx: &Ctx, node: u32, pos: usize, pen: f32, w: &mut Walk, out: &mut Vec<Hit>) {
+    if w.can_emit() {
         for &i in ctx.user.node_entries(node) {
             let e = ctx.user.entry(i);
-            let bonus = userdb::bonus(e.effective(ctx.now));
-            out.push(Hit { end: pos, src: Src::User(i), score: USER_BASE + pen, bonus, code: code.clone() });
+            out.push(Hit {
+                end: pos,
+                src: Src::User(i),
+                score: USER_BASE + pen,
+                bonus: userdb::bonus(e.effective(ctx.now)),
+                code: w.code.clone(),
+                fixes: w.fixes.clone(),
+                exact: w.inexact == 0,
+            });
         }
     }
-    if code.len() >= MAX_WORD_SYL {
+    if w.code.len() >= MAX_WORD_SYL {
         return;
     }
     let p = skip_apos(ctx.s, pos);
@@ -161,11 +273,22 @@ fn dfs_user(ctx: &Ctx, node: u32, pos: usize, pen: f32, code: &mut Vec<u16>, out
         return;
     }
     for t in &ctx.toks[p] {
-        let tp = pen + tok_pen(t);
+        if !w.usable(t) {
+            continue;
+        }
         for &(syl, child) in ctx.user.children_in(node, t.lo, t.hi) {
-            code.push(syl);
-            dfs_user(ctx, child, t.end, tp, code, out);
-            code.pop();
+            w.enter(syl, t);
+            match t.second {
+                None => dfs_user(ctx, child, t.end, pen + t.pen, w, out),
+                Some(sec) => {
+                    for &(s2, child2) in ctx.user.children_in(child, sec, sec + 1) {
+                        w.code.push(s2);
+                        dfs_user(ctx, child2, t.end, pen + t.pen, w, out);
+                        w.code.pop();
+                    }
+                }
+            }
+            w.leave(t);
         }
     }
 }
@@ -178,21 +301,56 @@ fn hit_text<'a>(ctx: &'a Ctx, h: &Hit) -> &'a str {
 }
 
 #[derive(Clone, Copy)]
-enum Back {
-    Edge { from: usize, at: usize, k: usize },
-    Raw { from: usize, at: usize },
-    Skip { from: usize },
+enum Step {
+    Start,
+    Edge { at: usize, k: usize },
+    Raw { at: usize },
+    Skip,
+}
+
+#[derive(Clone, Copy)]
+struct PathEnt {
+    score: f32,
+    prev: usize,
+    prev_k: usize,
+    step: Step,
+}
+
+fn push_k(list: &mut Vec<PathEnt>, e: PathEnt) {
+    if list.len() >= K_PATHS && list.last().is_some_and(|l| e.score <= l.score) {
+        return;
+    }
+    let i = list.partition_point(|x| x.score >= e.score);
+    list.insert(i, e);
+    list.truncate(K_PATHS);
+}
+
+/// 一条整句。
+struct Path {
+    text: String,
+    code: Vec<u16>,
+    pieces: usize,
+    raw: bool,
+    exact: bool,
+    score: f32,
+    fixes: Vec<Fix>,
+    typed_code: Option<Vec<u16>>,
+    syllables: usize,
 }
 
 /// 生成候选。`input` 是还没上屏的那部分输入（原样，可以有大写和 `'`）。
-pub fn analyze(dict: &Dict, user: &UserDb, input: &str, now: i64) -> Vec<Candidate> {
+pub fn analyze(dict: &Dict, en: Option<&EnglishDict>, user: &UserDb, input: &str, now: i64) -> Vec<Candidate> {
     if input.is_empty() || !input.is_ascii() {
         return Vec::new();
     }
     let lower = input.to_ascii_lowercase();
     let s = lower.as_bytes();
     let n = s.len();
-    let toks = tokenize(dict, s);
+    let fix_bonus = |f: &Fix| {
+        let (a, b) = f.key();
+        (1.2 * (1.0 + user.fix_count(&a, &b, now)).ln()) as f32
+    };
+    let toks = tokenize(dict, s, &fix_bonus);
     let ctx = Ctx { dict, user, toks: &toks, s, now };
     let start0 = skip_apos(s, 0);
 
@@ -205,167 +363,334 @@ pub fn analyze(dict: &Dict, user: &UserDb, input: &str, now: i64) -> Vec<Candida
         }
         let all = p == start0;
         let mut hits = Vec::new();
-        let mut code = Vec::new();
-        dfs_dict(&ctx, dict.root(), p, 0.0, &mut code, all, &mut hits);
-        dfs_user(&ctx, 0, p, 0.0, &mut code, &mut hits);
+        let mut w = Walk::default();
+        let per_end = if n <= SHORT_INPUT { PER_END_SHORT } else { PER_END };
+        dfs_dict(&ctx, dict.root(), p, 0.0, &mut w, if all { usize::MAX } else { per_end }, &mut hits);
+        dfs_user(&ctx, 0, p, 0.0, &mut w, &mut hits);
         // 删掉的词不出现
         hits.retain(|h| !user.is_blocked(&h.code, hit_text(&ctx, h)));
-        if all {
-            // 词库里的词如果你用过，加上记忆分（单字不加）
-            for h in hits.iter_mut() {
-                if let Src::Dict(w) = h.src {
-                    let t = dict.word_text(w);
-                    if t.chars().count() >= 2 {
-                        h.bonus = user.bonus(&h.code, t, now);
-                    }
+        // 词库里的词如果你用过，加上记忆分（单字不加）
+        for h in hits.iter_mut() {
+            if let Src::Dict(wi) = h.src {
+                let t = dict.word_text(wi);
+                if t.chars().count() >= 2 {
+                    h.bonus = user.bonus(&h.code, t, now);
                 }
             }
+        }
+        if all {
             first_hits = hits.clone();
         }
-        // 词网里每个终点只留最好的一条边
-        let mut best: Vec<Hit> = Vec::new();
+        // 每个终点只留最好的几条边
+        hits.sort_by(|a, b| b.end.cmp(&a.end).then(b.dp_score().total_cmp(&a.dp_score())));
+        let mut kept: Vec<Hit> = Vec::new();
+        let (mut cur, mut cnt) = (usize::MAX, 0);
         for h in hits {
-            match best.iter_mut().find(|b| b.end == h.end) {
-                Some(b) if b.dp_score() >= h.dp_score() => {}
-                Some(b) => *b = h,
-                None => best.push(h),
+            if h.end != cur {
+                cur = h.end;
+                cnt = 0;
+            }
+            if cnt < per_end {
+                kept.push(h);
+                cnt += 1;
             }
         }
-        edges[p] = best;
+        edges[p] = kept;
     }
 
-    // ---- 整句：在词网上找分数最高的路径 ----
-    let mut dp = vec![f32::NEG_INFINITY; n + 1];
-    let mut back: Vec<Option<Back>> = vec![None; n + 1];
-    dp[start0] = 0.0;
-    for p in 0..=n {
-        if dp[p] == f32::NEG_INFINITY || p == n {
+    // ---- 整句：在词网上找分数最高的若干条路径 ----
+    let mut paths: Vec<Vec<PathEnt>> = vec![Vec::new(); n + 1];
+    paths[start0].push(PathEnt { score: 0.0, prev: 0, prev_k: 0, step: Step::Start });
+    for p in 0..n {
+        if paths[p].is_empty() {
             continue;
         }
         let q = skip_apos(s, p);
-        if q >= n {
-            if dp[p] > dp[n] {
-                dp[n] = dp[p];
-                back[n] = Some(Back::Skip { from: p });
+        let entries = paths[p].clone();
+        for (ki, e) in entries.iter().enumerate() {
+            if q >= n {
+                push_k(&mut paths[n], PathEnt { score: e.score, prev: p, prev_k: ki, step: Step::Skip });
+                continue;
             }
-            continue;
-        }
-        for (k, h) in edges[q].iter().enumerate() {
-            let v = dp[p] + h.dp_score();
-            if v > dp[h.end] {
-                dp[h.end] = v;
-                back[h.end] = Some(Back::Edge { from: p, at: q, k });
+            for (k, h) in edges[q].iter().enumerate() {
+                let ent = PathEnt { score: e.score + h.dp_score(), prev: p, prev_k: ki, step: Step::Edge { at: q, k } };
+                push_k(&mut paths[h.end], ent);
             }
-        }
-        let v = dp[p] + PEN_RAW;
-        if v > dp[q + 1] {
-            dp[q + 1] = v;
-            back[q + 1] = Some(Back::Raw { from: p, at: q });
+            let raw = PathEnt { score: e.score + PEN_RAW, prev: p, prev_k: ki, step: Step::Raw { at: q } };
+            push_k(&mut paths[q + 1], raw);
         }
     }
-    let mut pieces: Vec<(String, Vec<u16>)> = Vec::new();
-    let mut used_raw = false;
-    let mut p = n;
-    while p != start0 {
-        match back[p] {
-            Some(Back::Edge { from, at, k }) => {
-                let h = &edges[at][k];
-                pieces.push((hit_text(&ctx, h).to_string(), h.code.clone()));
-                p = from;
+    let extract = |k: usize| -> Path {
+        let mut pieces: Vec<(String, Option<&Hit>)> = Vec::new();
+        let (mut pos, mut idx) = (n, k);
+        let score = paths[n][k].score;
+        loop {
+            let e = paths[pos][idx];
+            match e.step {
+                Step::Start => break,
+                Step::Edge { at, k } => {
+                    let h = &edges[at][k];
+                    pieces.push((hit_text(&ctx, h).to_string(), Some(h)));
+                }
+                Step::Raw { at } => pieces.push((input[at..at + 1].to_string(), None)),
+                Step::Skip => {}
             }
-            Some(Back::Raw { from, at }) => {
-                pieces.push((input[at..at + 1].to_string(), Vec::new()));
-                used_raw = true;
-                p = from;
-            }
-            Some(Back::Skip { from }) => p = from,
-            None => break,
+            pos = e.prev;
+            idx = e.prev_k;
         }
-    }
-    pieces.reverse();
+        pieces.reverse();
+        let mut p = Path {
+            text: String::new(),
+            code: Vec::new(),
+            pieces: 0,
+            raw: false,
+            exact: true,
+            score,
+            fixes: Vec::new(),
+            typed_code: Some(Vec::new()),
+            syllables: 0,
+        };
+        let mut any_fix = false;
+        for (t, h) in pieces {
+            p.text.push_str(&t);
+            match h {
+                Some(h) => {
+                    p.pieces += 1;
+                    p.code.extend_from_slice(&h.code);
+                    p.syllables += h.code.len();
+                    p.exact &= h.exact;
+                    p.fixes.extend(h.fixes.iter().map(|f| f.1));
+                    any_fix |= !h.fixes.is_empty();
+                    let tc = if h.fixes.is_empty() { Some(h.code.clone()) } else { h.typed_code() };
+                    match (&mut p.typed_code, tc) {
+                        (Some(all), Some(c)) => all.extend(c),
+                        _ => p.typed_code = None,
+                    }
+                }
+                None => {
+                    p.raw = true;
+                    p.exact = false;
+                }
+            }
+        }
+        if !any_fix {
+            p.typed_code = None;
+        }
+        p
+    };
+    let best = if paths[n].is_empty() { None } else { Some(extract(0)) };
+    // 不纠错能不能拼成拼音（不能的话多半是英文或别的，原样字母排第一）
+    let plain_needs_raw = {
+        let mut ok = vec![false; n + 1];
+        ok[start0] = true;
+        for p in 0..n {
+            if !ok[p] {
+                continue;
+            }
+            let q = skip_apos(s, p);
+            if q >= n {
+                ok[n] = true;
+                continue;
+            }
+            for h in edges[q].iter().filter(|h| h.fixes.is_empty()) {
+                ok[h.end] = true;
+            }
+        }
+        !ok[n]
+    };
 
     // ---- 候选列表 ----
-    let mut cands: Vec<Candidate> = Vec::new();
+    let mut out: Vec<Candidate> = Vec::new();
+    let mut tail: Vec<Candidate> = Vec::new();
     let has_upper = input.bytes().any(|b| b.is_ascii_uppercase());
-    if has_upper || used_raw {
-        cands.push(Candidate {
-            text: input.to_string(),
-            consumed: n,
-            code: Vec::new(),
-            score: 0.0,
-            kind: CandKind::Raw,
-            poor: false,
-            learnable: false,
-        });
+    let used_raw = best.as_ref().is_none_or(|b| b.raw);
+    if has_upper || used_raw || plain_needs_raw {
+        out.push(Candidate::simple(input.to_string(), n, 0.0, CandKind::Raw));
     }
-    let word_pieces = pieces.iter().filter(|(_, c)| !c.is_empty()).count();
-    if !used_raw && word_pieces >= 2 {
-        let text: String = pieces.iter().map(|(t, _)| t.as_str()).collect();
-        let code: Vec<u16> = pieces.iter().flat_map(|(_, c)| c.iter().copied()).collect();
-        let chars = text.chars().count();
-        cands.push(Candidate {
-            text,
-            consumed: n,
-            code,
-            score: dp[n],
-            kind: CandKind::Sentence,
-            poor: false,
-            learnable: chars <= LEARN_SENTENCE_MAX,
-        });
-    }
-
-    let covers_all = |end: usize| skip_apos(s, end) >= n;
-    let rank = |h: &Hit| {
-        let syl = h.code.len() as f32;
-        h.rank_score() + if covers_all(h.end) { MULTI_SYL_BONUS * (syl - 1.0) } else { 0.0 }
+    let sentence_cand = |p: &Path| Candidate {
+        text: p.text.clone(),
+        consumed: n,
+        code: p.code.clone(),
+        score: p.score,
+        base: p.score,
+        kind: CandKind::Sentence,
+        poor: false,
+        learnable: p.text.chars().count() <= LEARN_SENTENCE_MAX,
+        fixes: p.fixes.clone(),
+        typed_code: p.typed_code.clone(),
     };
-    let mut full: Vec<(f32, &Hit)> = first_hits.iter().filter(|h| covers_all(h.end)).map(|h| (rank(h), h)).collect();
-    full.sort_by(|a, b| b.0.total_cmp(&a.0));
-    let mut part: Vec<(f32, &Hit)> = first_hits.iter().filter(|h| !covers_all(h.end)).map(|h| (rank(h), h)).collect();
-    part.sort_by(|a, b| b.1.end.cmp(&a.1.end).then(b.0.total_cmp(&a.0)));
-
-    let mut group_best: Option<(usize, f32)> = None;
-    for (r, h) in full.into_iter().chain(part) {
-        let consumed = if covers_all(h.end) { n } else { h.end };
-        let gb = match group_best {
-            Some((c, b)) if c == consumed => b,
-            _ => {
-                group_best = Some((consumed, r));
-                r
-            }
-        };
-        cands.push(Candidate {
-            text: hit_text(&ctx, h).to_string(),
-            consumed,
-            code: h.code.clone(),
-            score: r,
-            kind: CandKind::Word,
-            poor: r < gb - POOR_GAP,
-            learnable: true,
-        });
-    }
-
-    // 记住的词如果比整句还好，排到整句前面（"选过一次，下次第一个就是它"）
-    if let Some(si) = cands.iter().position(|c| c.kind == CandKind::Sentence) {
-        if let Some(fi) = cands.iter().position(|c| c.kind == CandKind::Word && c.consumed == n) {
-            let learned = first_hits.iter().any(|h| h.bonus > 0.0 && hit_text(&ctx, h) == cands[fi].text);
-            let word_raw = first_hits
-                .iter()
-                .filter(|h| hit_text(&ctx, h) == cands[fi].text)
-                .map(|h| h.rank_score())
-                .fold(f32::NEG_INFINITY, f32::max);
-            if learned && word_raw > cands[si].score {
-                let w = cands.remove(fi);
-                cands.insert(si, w);
+    if let Some(b) = &best {
+        if !b.raw && b.pieces >= 2 {
+            if plain_needs_raw && !b.fixes.is_empty() {
+                // 不像拼音的输入，纠错硬拼出来的整句放后面
+                let mut c = sentence_cand(b);
+                c.poor = true;
+                tail.push(c);
+            } else {
+                out.push(sentence_cand(b));
             }
         }
     }
 
+    // ---- 英文 ----
+    let letters_only = s.iter().all(|b| b.is_ascii_lowercase());
+    let mut ens: Vec<Candidate> = Vec::new();
+    if letters_only && n >= 2 {
+        let valid_pinyin = best.as_ref().is_some_and(|b| b.exact && !b.raw);
+        let prior = EN_PRIOR + if valid_pinyin && !has_upper { EN_PRIOR_VALID_PINYIN } else { 0.0 };
+        let mut add = |text: &str, key: &str, score: f32| {
+            let b =
+                user.english().get(key).map(|e| userdb::bonus(userdb::effective(e.freq, e.last, now))).unwrap_or(0.0);
+            let mut c = Candidate::simple(match_case(text, input), n, score + prior + b, CandKind::English);
+            c.base = score + prior;
+            c.learnable = true;
+            ens.push(c);
+        };
+        if let Some(en) = en {
+            for h in en.search(s) {
+                let w = en.word(h.word);
+                add(&w.text, &w.text.to_ascii_lowercase(), w.score + h.penalty);
+            }
+        }
+        // 你打过的、词表里没有的英文词
+        let maxc = max_cost(n);
+        for (key, e) in user.english() {
+            let kb = key.as_bytes();
+            let pen = if kb == s {
+                Some(0.0)
+            } else if n >= 3 && kb.starts_with(s) {
+                Some(-1.5 - 0.15 * (kb.len() - n) as f32)
+            } else if maxc > 0.0 && kb.len().abs_diff(n) <= 2 {
+                let c = edit_cost(s, kb);
+                (c <= maxc).then_some(c * -4.0)
+            } else {
+                None
+            };
+            if let Some(p) = pen {
+                add(&e.text, key, EN_USER_BASE + p);
+            }
+        }
+        ens.sort_by(|a, b| b.score.total_cmp(&a.score));
+        let mut seen = HashSet::new();
+        ens.retain(|c| seen.insert(c.text.clone()));
+        ens.truncate(MAX_EN);
+    }
+    let en_best = ens.first().map(|c| c.score).unwrap_or(f32::NEG_INFINITY);
+
+    let covers_all = |end: usize| skip_apos(s, end) >= n;
+    let multi = |h: &Hit| if covers_all(h.end) { MULTI_SYL_BONUS * (h.code.len() as f32 - 1.0) } else { 0.0 };
+    let word_cand = |h: &Hit, poor: bool| Candidate {
+        text: hit_text(&ctx, h).to_string(),
+        consumed: if covers_all(h.end) { n } else { h.end },
+        code: h.code.clone(),
+        score: h.rank_score() + multi(h),
+        base: h.score + multi(h),
+        kind: CandKind::Word,
+        poor,
+        learnable: true,
+        fixes: h.fixes.iter().map(|f| f.1).collect(),
+        typed_code: h.typed_code(),
+    };
+    let mut full: Vec<&Hit> = first_hits.iter().filter(|h| covers_all(h.end)).collect();
+    full.sort_by(|a, b| (b.rank_score() + multi(b)).total_cmp(&(a.rank_score() + multi(a))));
+    // 只对上开头一部分的候选不用纠错（纠错只用在能把整串对上的时候）
+    let mut part: Vec<&Hit> = first_hits.iter().filter(|h| !covers_all(h.end) && h.fixes.is_empty()).collect();
+    part.sort_by(|a, b| b.end.cmp(&a.end).then(b.rank_score().total_cmp(&a.rank_score())));
+    let best_full_base = full.iter().map(|h| h.score + multi(h)).fold(f32::NEG_INFINITY, f32::max);
+    // 不纠错的候选里最好的分数：纠错候选只有比它还好才放前面（haozhang 不能被改成"保障"）
+    // 不纠错的整句里最好的那条（也比较英文）：纠错的词只有比它还好才放前面
+    let best_plain = (0..paths[n].len())
+        .map(&extract)
+        .find(|p| p.fixes.is_empty() && !p.raw)
+        .map(|p| p.score)
+        .unwrap_or(f32::NEG_INFINITY)
+        .max(en_best);
+    let best_part_base = part.iter().map(|h| h.score).fold(f32::NEG_INFINITY, f32::max);
+
+    // 全部对上的字词
+    for h in &full {
+        let base = h.score + multi(h);
+        let multi_char = hit_text(&ctx, h).chars().count() >= 2;
+        let poor = base < best_full_base - POOR_GAP;
+        let unneeded_fix = !h.fixes.is_empty() && h.rank_score() < best_plain;
+        let weak = unneeded_fix
+            || multi_char
+                && h.bonus == 0.0
+                && base < best_full_base - WEAK_WORD_GAP
+                && h.score < best_part_base - WEAK_VS_PARTIAL_GAP;
+        if poor || weak {
+            tail.push(word_cand(h, true));
+        } else {
+            out.push(word_cand(h, false));
+        }
+    }
+    // 组合（好+胀 这种）
+    let mut combo_more: Vec<Candidate> = Vec::new();
+    if let Some(b) = &best {
+        let mut top = 0;
+        for k in 1..paths[n].len() {
+            let p = extract(k);
+            if p.raw || p.pieces < 2 {
+                continue;
+            }
+            let near = p.score >= b.score - COMBO_GAP && b.syllables <= COMBO_TOP_MAX_SYL;
+            let more = p.score >= b.score - COMBO_MORE_GAP && b.syllables <= COMBO_MORE_MAX_SYL;
+            let mut c = sentence_cand(&p);
+            if near && top < COMBO_TOP {
+                out.push(c);
+                top += 1;
+            } else if more && combo_more.len() < COMBO_MORE {
+                c.poor = true;
+                combo_more.push(c);
+            } else {
+                c.poor = true;
+                tail.push(c);
+            }
+        }
+    }
+    // 只对上开头的字词
+    let full_end = out.len();
+    let mut group: Option<(usize, f32)> = None;
+    let mut part_poor = Vec::new();
+    let mut part_n = 0;
+    for h in &part {
+        let gb = match group {
+            Some((e, b)) if e == h.end => b,
+            _ => {
+                group = Some((h.end, h.score));
+                h.score
+            }
+        };
+        if h.score < gb - POOR_GAP {
+            part_poor.push(word_cand(h, true));
+        } else {
+            out.push(word_cand(h, false));
+            part_n += 1;
+            if part_n == PARTIAL_HEAD {
+                // 开头几个单字之后，放第二档组合（它们标成"差"，候选条到这里为止）
+                out.append(&mut combo_more);
+            }
+        }
+    }
+    // 单字不够 5 个的，第二档组合排在单字后面
+    out.append(&mut combo_more);
+
+    // 英文插进"全部对上"的那一段：按分数找位置；原样字母永远在最前
+    {
+        let lo = usize::from(out.first().is_some_and(|c| c.kind == CandKind::Raw));
+        for (end, c) in (full_end..).zip(ens) {
+            let pos = (lo..end).find(|&i| out[i].score < c.score).unwrap_or(end);
+            out.insert(pos, c);
+        }
+    }
+
+    out.extend(tail);
+    out.extend(part_poor);
     // 去重（保留排在前面的），限制总数
     let mut seen = HashSet::new();
-    cands.retain(|c| seen.insert(c.text.clone()));
-    cands.truncate(MAX_CANDS);
-    cands
+    out.retain(|c| seen.insert(c.text.clone()));
+    out.truncate(MAX_CANDS);
+    out
 }
 
 #[cfg(test)]
@@ -374,7 +699,10 @@ mod tests {
     use crate::dict::DictBuilder;
 
     fn dict() -> Dict {
-        let syl = ["xi", "an", "xian", "zai", "wo", "zhong", "guo", "ren", "fang", "fan", "gan"];
+        let syl = [
+            "xi", "an", "xian", "zai", "wo", "zhong", "guo", "ren", "fang", "fan", "gan", "xu", "huan", "hao", "zhang",
+            "ni",
+        ];
         let mut b = DictBuilder::new(syl.map(String::from));
         let mut add = |py: &str, t: &str, s: f32| {
             let c = b.code(py).unwrap();
@@ -384,6 +712,7 @@ mod tests {
         add("xian", "现", -6.3);
         add("xian", "线", -7.5);
         add("xi", "西", -7.0);
+        add("xi", "喜", -7.2);
         add("an", "安", -8.0);
         add("xi an", "西安", -9.5);
         add("xian zai", "现在", -7.0);
@@ -396,12 +725,22 @@ mod tests {
         add("zhong guo ren", "中国人", -8.0);
         add("fang an", "方案", -7.0);
         add("fan gan", "反感", -9.0);
-        let bytes = b.build();
-        Dict::from_bytes(bytes).unwrap()
+        add("xi huan", "喜欢", -7.0);
+        add("xu", "需", -8.0);
+        add("huan", "欢", -10.0);
+        add("hao", "好", -5.0);
+        add("zhang", "张", -7.0);
+        add("zhang", "长", -7.2);
+        add("zhang", "胀", -10.0);
+        add("hao zhang", "好长", -9.0);
+        add("ni", "你", -5.0);
+        add("ni hao", "你好", -6.0);
+        add("ni hao", "拟好", -11.0);
+        Dict::from_bytes(b.build()).unwrap()
     }
 
     fn texts(d: &Dict, u: &UserDb, s: &str) -> Vec<String> {
-        analyze(d, u, s, 0).into_iter().map(|c| c.text).collect()
+        analyze(d, None, u, s, 0).into_iter().map(|c| c.text).collect()
     }
 
     #[test]
@@ -412,7 +751,6 @@ mod tests {
         assert_eq!(t[0], "先");
         let pos = t.iter().position(|x| x == "西安").unwrap();
         assert!(pos <= 3, "{t:?}");
-        // 打了分隔符，西安排第一
         assert_eq!(texts(&d, &u, "xi'an")[0], "西安");
         let t = texts(&d, &u, "fangan");
         assert_eq!(&t[..2], &["方案", "反感"]);
@@ -432,36 +770,98 @@ mod tests {
     fn partial_candidates_come_after_full_ones() {
         let d = dict();
         let u = UserDb::in_memory();
-        let c = analyze(&d, &u, "woxianzai", 0);
+        let c = analyze(&d, None, &u, "woxianzai", 0);
         assert_eq!(c[0].kind, CandKind::Sentence);
         assert!(c.iter().any(|c| c.text == "我" && c.consumed == 2));
+    }
+
+    #[test]
+    fn rare_full_word_goes_after_common_single_chars() {
+        let d = dict();
+        let u = UserDb::in_memory();
+        let t = texts(&d, &u, "nihao");
+        assert_eq!(t[0], "你好");
+        let ni = t.iter().position(|x| x == "你").unwrap();
+        let nh = t.iter().position(|x| x == "拟好").unwrap();
+        assert!(ni < nh, "{t:?}");
+    }
+
+    #[test]
+    fn combinations_not_in_dictionary_appear() {
+        let d = dict();
+        let u = UserDb::in_memory();
+        let t = texts(&d, &u, "haozhang");
+        assert_eq!(t[0], "好长");
+        assert!(t.contains(&"好胀".to_string()), "{t:?}");
+        assert!(t.contains(&"好张".to_string()), "{t:?}");
+    }
+
+    #[test]
+    fn typo_is_corrected_in_words() {
+        let d = dict();
+        let u = UserDb::in_memory();
+        let c = analyze(&d, None, &u, "woxuhuan", 0);
+        assert_eq!(c[0].text, "我喜欢");
+        assert!(c[0].corrected());
+        // 单独打 xu 不会被改成 xi（单字不纠正本来就对的拼音）
+        assert_eq!(texts(&d, &u, "xu")[0], "需");
+        assert!(!texts(&d, &u, "xu").contains(&"喜".to_string()));
     }
 
     #[test]
     fn unparseable_letters_give_raw_candidate() {
         let d = dict();
         let u = UserDb::in_memory();
-        let c = analyze(&d, &u, "iii", 0);
+        let c = analyze(&d, None, &u, "iii", 0);
         assert_eq!(c[0].kind, CandKind::Raw);
         assert_eq!(c[0].text, "iii");
-        let c = analyze(&d, &u, "Xian", 0);
+        let c = analyze(&d, None, &u, "Xian", 0);
         assert_eq!(c[0].text, "Xian");
         assert_eq!(c[1].text, "先");
+    }
+
+    #[test]
+    fn english_words_mix_in() {
+        let d = dict();
+        let u = UserDb::in_memory();
+        let en = EnglishDict::from_words(vec![("help".into(), -6.6), ("helpful".into(), -9.8), ("an".into(), -4.0)]);
+        let c: Vec<String> = analyze(&d, Some(&en), &u, "help", 0).into_iter().map(|c| c.text).collect();
+        assert_eq!(c[0], "help", "{c:?}");
+        assert!(c.contains(&"helpful".to_string()));
+        // 大写开头：原样第一，英文跟着大写
+        let c: Vec<String> = analyze(&d, Some(&en), &u, "Help", 0).into_iter().map(|c| c.text).collect();
+        assert_eq!(c[0], "Help");
+        assert!(c.contains(&"Helpful".to_string()), "{c:?}");
+        // 本来就是完整拼音的，中文在前
+        let c: Vec<String> = analyze(&d, Some(&en), &u, "an", 0).into_iter().map(|c| c.text).collect();
+        assert_eq!(c[0], "安", "{c:?}");
     }
 
     #[test]
     fn learned_word_goes_first() {
         let d = dict();
         let mut u = UserDb::in_memory();
-        let c = analyze(&d, &u, "fangan", 0);
+        let c = analyze(&d, None, &u, "fangan", 0);
         let fg = c.iter().find(|c| c.text == "反感").unwrap().clone();
         u.learn(&d, &fg.code, "反感", 0);
         assert_eq!(texts(&d, &u, "fangan")[0], "反感");
-        // 用户自己造的新词（词库里没有）
         let code: Vec<u16> = ["xi", "an", "ren"].iter().map(|p| d.syllable_id(p).unwrap()).collect();
         u.learn(&d, &code, "西安人", 0);
         assert_eq!(texts(&d, &u, "xianren")[0], "西安人");
         assert_eq!(texts(&d, &u, "xianr")[0], "西安人");
+    }
+
+    #[test]
+    fn learned_word_keeps_other_candidates_visible() {
+        let d = dict();
+        let mut u = UserDb::in_memory();
+        let c = analyze(&d, None, &u, "fangan", 0);
+        let fg = c.iter().find(|c| c.text == "反感").unwrap().clone();
+        u.learn(&d, &fg.code, "反感", 0);
+        let c = analyze(&d, None, &u, "fangan", 0);
+        // 记住的词排第一，但其他候选不能因此被判成"质量差"
+        assert_eq!(c[0].text, "反感");
+        assert!(!c.iter().find(|c| c.text == "方案").unwrap().poor, "{c:?}");
     }
 
     #[test]

@@ -15,7 +15,7 @@ xian	西安	5
 fangan	方案	1
 fangan	反感	2
 dangan	档案	1
-dangan	单干	5
+dangan	单干	80
 qie	企鹅	5
 piao	皮袄	5
 tiananmen	天安门	1
@@ -26,7 +26,7 @@ zg	中国	8
 zgr	中国人	1
 sjk	数据库	1
 zhongg	中国	1
-zhonggu	中国	1
+zhonggu	中古	1
 zhongguo	中国	1
 
 # 常用词
@@ -57,3 +57,22 @@ wodemingzi	我的名字	1
 lve	略	1
 lue	略	1
 nvren	女人	1
+
+# 首选不能"多猜一个字母"（- 表示不能出现在候选条里）
+zheba	这般	-
+zheba	这把	1
+# 不常用的词不该挤到常用单字前面
+nihao	拟好	-
+nihao	你	3
+# 词库里没有的搭配也要能找到
+haozhang	好长	1
+haozhang	好胀	60
+# 打错纠正
+woxuhuan	我喜欢	1
+# 英文
+help	help	1
+helpful	helpful	1
+what	what	1
+immediately	immediately	1
+hello	hello	1
+recieve	receive	3

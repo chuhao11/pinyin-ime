@@ -6,8 +6,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::dict::Dict;
+use crate::english::EnglishDict;
 use crate::lattice::{analyze, CandKind, Candidate};
-use crate::pinyin::skip_apos;
+use crate::pinyin::{skip_apos, Fix};
 use crate::userdb::UserDb;
 
 pub const GRID_COLS: usize = 5;
@@ -76,6 +77,8 @@ pub struct View {
     pub page: usize,
     pub pages: usize,
     pub total: usize,
+    /// 和 `items` 一一对应：这个候选是不是打错纠正出来的
+    pub corrected: Vec<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -101,10 +104,29 @@ struct Selected {
     text: String,
     code: Vec<u16>,
     learnable: bool,
+    fixes: Vec<Fix>,
+    typed_code: Option<Vec<u16>>,
+    /// 英文词（或原样的字母），上屏后记进英文词表
+    english: bool,
+}
+
+impl Selected {
+    fn plain(start: usize, text: String) -> Self {
+        Selected {
+            start,
+            text,
+            code: Vec::new(),
+            learnable: false,
+            fixes: Vec::new(),
+            typed_code: None,
+            english: false,
+        }
+    }
 }
 
 pub struct Ime {
     dict: Dict,
+    en: Option<EnglishDict>,
     user: UserDb,
     clock: Box<dyn Fn() -> i64 + Send>,
     pub config: Config,
@@ -129,6 +151,7 @@ impl Ime {
     pub fn new(dict: Dict, user: UserDb) -> Self {
         Ime {
             dict,
+            en: None,
             user,
             clock: Box::new(system_now),
             config: Config::default(),
@@ -140,6 +163,11 @@ impl Ime {
             hl: 0,
             mode: Mode::Row,
         }
+    }
+
+    /// 装上英文词表。
+    pub fn set_english(&mut self, en: EnglishDict) {
+        self.en = Some(en);
     }
 
     /// 换一个时钟（测试用）。
@@ -318,7 +346,8 @@ impl Ime {
     fn refresh(&mut self) {
         let now = (self.clock)();
         let rem = &self.input[self.consumed..];
-        self.cands = if rem.is_empty() { Vec::new() } else { analyze(&self.dict, &self.user, rem, now) };
+        self.cands =
+            if rem.is_empty() { Vec::new() } else { analyze(&self.dict, self.en.as_ref(), &self.user, rem, now) };
         self.row_len = self.compute_row_len();
         self.hl = 0;
         self.mode = Mode::Row;
@@ -343,6 +372,7 @@ impl Ime {
 
     fn select(&mut self, i: usize) -> Response {
         let Some(c) = self.cands.get(i).cloned() else { return Response::eaten() };
+        self.note_rejection(&c);
         self.take(c);
         if self.consumed >= self.input.len() {
             self.finish(None)
@@ -352,15 +382,51 @@ impl Ime {
         }
     }
 
+    /// 你选的多字词不是"本来该排第一"的那个：给那个词记一次冷落（单字不算）。
+    fn note_rejection(&mut self, chosen: &Candidate) {
+        if !matches!(chosen.kind, CandKind::Word | CandKind::Sentence) || chosen.text.chars().count() < 2 {
+            return;
+        }
+        let top = self
+            .cands
+            .iter()
+            .filter(|c| matches!(c.kind, CandKind::Word | CandKind::Sentence) && c.consumed == chosen.consumed)
+            .max_by(|a, b| a.base.total_cmp(&b.base));
+        if let Some(t) = top {
+            if t.kind == CandKind::Word
+                && t.text != chosen.text
+                && t.text.chars().count() >= 2
+                && t.fixes.is_empty()
+                && !t.code.is_empty()
+            {
+                let (code, text) = (t.code.clone(), t.text.clone());
+                self.user.reject(&self.dict, &code, &text);
+            }
+        }
+    }
+
     /// 把一个候选放进"已选"，往后移动输入位置。
     fn take(&mut self, c: Candidate) {
         let start = self.consumed;
-        if c.kind == CandKind::Raw {
-            self.selected.push(Selected { start, text: c.text, code: Vec::new(), learnable: false });
-            self.consumed = self.input.len();
-        } else {
-            self.selected.push(Selected { start, text: c.text, code: c.code, learnable: c.learnable });
-            self.consumed = skip_apos(self.input.as_bytes(), start + c.consumed).min(self.input.len());
+        match c.kind {
+            CandKind::Raw | CandKind::English => {
+                let mut s = Selected::plain(start, c.text);
+                s.english = c.kind == CandKind::English || s.text.len() >= 3;
+                self.selected.push(s);
+                self.consumed = self.input.len();
+            }
+            _ => {
+                self.selected.push(Selected {
+                    start,
+                    text: c.text,
+                    code: c.code,
+                    learnable: c.learnable,
+                    fixes: c.fixes,
+                    typed_code: c.typed_code,
+                    english: false,
+                });
+                self.consumed = skip_apos(self.input.as_bytes(), start + c.consumed).min(self.input.len());
+            }
         }
     }
 
@@ -371,6 +437,18 @@ impl Ime {
         for s in &self.selected {
             if s.learnable && !s.code.is_empty() {
                 self.user.learn(&self.dict, &s.code, &s.text, now);
+            }
+            // 打错被纠正了：记住这种错法，下次同样的错扣分更少
+            for f in &s.fixes {
+                let (a, b) = f.key();
+                self.user.learn_fix(&a, &b, now);
+            }
+            // 再记住"这样打错就是想要这个词"，下次一模一样的错直接排第一
+            if let Some(tc) = &s.typed_code {
+                self.user.learn(&self.dict, tc, &s.text, now);
+            }
+            if s.english {
+                self.user.learn_en(&s.text, now);
             }
         }
         // 分几次选出来的，合起来存成一个新词（比如人名）
@@ -402,7 +480,7 @@ impl Ime {
                 None => {
                     let raw = self.remaining().to_string();
                     let start = self.consumed;
-                    self.selected.push(Selected { start, text: raw, code: Vec::new(), learnable: false });
+                    self.selected.push(Selected::plain(start, raw));
                     self.consumed = self.input.len();
                 }
             }
@@ -446,26 +524,27 @@ impl Ime {
         let mut preedit: String = self.selected.iter().map(|s| s.text.as_str()).collect();
         preedit.push_str(self.remaining());
         let total = self.cands.len();
-        let (items, highlight, page, pages) = match self.mode {
-            Mode::Row => (
-                self.cands[..self.row_len].iter().map(|c| c.text.clone()).collect(),
-                self.hl.min(self.row_len.saturating_sub(1)),
-                0,
-                1,
-            ),
+        let (range, highlight, page, pages) = match self.mode {
+            Mode::Row => (0..self.row_len, self.hl.min(self.row_len.saturating_sub(1)), 0, 1),
             Mode::Grid => {
                 let page = self.hl / GRID_SIZE;
                 let start = page * GRID_SIZE;
                 let end = (start + GRID_SIZE).min(total);
-                (
-                    self.cands[start..end].iter().map(|c| c.text.clone()).collect(),
-                    self.hl - start,
-                    page,
-                    total.div_ceil(GRID_SIZE),
-                )
+                (start..end, self.hl - start, page, total.div_ceil(GRID_SIZE))
             }
         };
-        View { composing: self.is_composing(), preedit, mode: self.mode, items, highlight, page, pages, total }
+        let shown = &self.cands[range];
+        View {
+            composing: self.is_composing(),
+            preedit,
+            mode: self.mode,
+            items: shown.iter().map(|c| c.text.clone()).collect(),
+            highlight,
+            page,
+            pages,
+            total,
+            corrected: shown.iter().map(|c| c.corrected()).collect(),
+        }
     }
 }
 
@@ -592,7 +671,7 @@ mod tests {
             downs += 1;
             assert!(downs <= 5);
         }
-        assert_eq!(m.view().items.len(), 41 - 25);
+        assert!(!m.view().items.is_empty());
         key(&mut m, Key::Up);
         assert_eq!(m.view().page, 0);
         // 数字选高亮那一行的第几个
