@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::dict::Dict;
 use crate::english::EnglishDict;
 use crate::lattice::{analyze_with, CandKind, Candidate, Query};
-use crate::lm::Lm;
+use crate::lm::{Lm, NUM_TOKEN};
 use crate::pinyin::{skip_apos, Fix};
 use crate::userdb::UserDb;
 
@@ -264,8 +264,14 @@ impl Ime {
                     return Response::eaten();
                 }
             }
-            // 原样交给程序的键（符号、空格、回车、方向键……）：上文断开
-            self.ctx = None;
+            // 原样交给程序的键（符号、空格、回车、方向键……）：上文断开。
+            // 数字例外：它是"前面是数字"这个上文（2010 后面打 n，"年"排第一）
+            self.ctx = match key {
+                Key::Char(c) if c.is_ascii_digit() => {
+                    self.lm.as_ref().and_then(|l| l.id(NUM_TOKEN)).map(|id| (id, (self.clock)()))
+                }
+                _ => None,
+            };
             return Response::pass();
         }
         match self.mode {
@@ -501,6 +507,10 @@ impl Ime {
         for s in &self.selected {
             if s.learnable && !s.code.is_empty() {
                 self.user.learn(&self.dict, &s.code, &s.text, now);
+            }
+            // 单字：慢慢记（选几十次才会换位置）
+            if s.code.len() == 1 && s.text.chars().count() == 1 {
+                self.user.learn_char(&self.dict, s.code[0], &s.text, now);
             }
             // 打错被纠正了：记住这种错法，下次同样的错扣分更少
             for f in &s.fixes {
@@ -785,13 +795,28 @@ mod tests {
     }
 
     #[test]
-    fn single_chars_do_not_reorder() {
+    fn single_chars_reorder_only_after_many_picks() {
         let mut m = ime();
+        // 选 5 次"事"："是"还在第一
         for _ in 0..5 {
             assert_eq!(typ(&mut m, "shi2"), "事");
         }
         typ(&mut m, "shi");
         assert_eq!(m.view().items[0], "是");
+        key(&mut m, Key::Escape);
+        // 一直选"事"，选到几十次以后"事"排第一
+        let mut n = 5;
+        loop {
+            typ(&mut m, "shi");
+            if m.view().items[0] == "事" {
+                break;
+            }
+            let i = m.view().items.iter().position(|t| t == "事").unwrap();
+            key(&mut m, Key::Char(char::from(b'1' + i as u8)));
+            n += 1;
+            assert!(n < 200, "选了 200 次还没换");
+        }
+        assert!(n >= 20, "只选了 {n} 次就换了，太快");
     }
 
     #[test]
@@ -872,6 +897,34 @@ mod tests {
         assert_eq!(key(&mut m, Key::Char(',')), Response::pass());
         typ(&mut m, "ba");
         assert_eq!(m.view().items[0], "把");
+    }
+
+    #[test]
+    fn number_before_changes_choice() {
+        use crate::lm::{Lm, LmBuilder};
+        let mut b = DictBuilder::new(["ni", "nian"].map(String::from));
+        let ni = b.code("ni").unwrap();
+        let nian = b.code("nian").unwrap();
+        b.add(&ni, "你", -5.0);
+        b.add(&nian, "年", -6.0);
+        let d = Dict::from_bytes(b.build()).unwrap();
+        // 词表按字节排序：<数字> 你 年；数字后面常跟"年"
+        let lm = LmBuilder {
+            vocab: [NUM_TOKEN, "你", "年"].map(String::from).to_vec(),
+            uni: vec![-8.0, -4.0, -7.0],
+            backoff: vec![-2.0, -1.0, -1.0],
+            succ: vec![vec![(2, -0.5)], vec![], vec![]],
+            fallback_offset: 0.0,
+        };
+        let mut m = Ime::new(d, UserDb::in_memory());
+        m.set_lm(Lm::from_bytes(lm.build()).unwrap());
+        m.set_clock(|| 1000);
+        typ(&mut m, "n");
+        assert_eq!(m.view().items[0], "你");
+        key(&mut m, Key::Escape);
+        assert_eq!(typ(&mut m, "2010"), "2010");
+        typ(&mut m, "n");
+        assert_eq!(m.view().items[0], "年");
     }
 
     #[test]

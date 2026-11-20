@@ -1,6 +1,6 @@
 //! 用户词库：记住你选过的词和自己拼出来的词。
 //!
-//! - 只记两个字以上的词，单字不调频。
+//! - 词和人名选一次就排第一；单字记得很慢（要选几十次才会换位置，"是"不会因为偶尔选了"事"就掉下去）。
 //! - 每个词记"有效次数"和最后使用时间；有效次数随时间按半衰期衰减，所以很久不用的词会慢慢退回去。
 //! - 条数有上限，超过后淘汰有效次数最低的，内存和文件都不会无限增长。
 //! - 存在本机 SQLite 文件里（WAL 模式，断电也不会损坏）；不保存任何打字记录。
@@ -22,6 +22,13 @@ pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
 pub const MAX_SMALL_ENTRIES: usize = 5_000;
 /// 首选被冷落这么多次就删掉。
 pub const REJECT_LIMIT: u32 = 3;
+/// 单字最多记这么多条。
+pub const MAX_CHAR_ENTRIES: usize = 20_000;
+
+/// 单字的记忆加分：很慢地增长，选 5 次约 +0.6，选 40 次约 +2.2，选 300 次约 +4.4。
+pub fn char_bonus(eff: f64) -> f32 {
+    (1.2 * (1.0 + eff / 8.0).ln()) as f32
+}
 
 /// 记住的英文词。
 pub struct UEn {
@@ -73,6 +80,8 @@ pub struct UserDb {
     en: HashMap<String, UEn>,
     /// 首选被冷落的次数
     rejects: HashMap<(Vec<u16>, String), u32>,
+    /// 单字：(音节, 字) → (有效次数, 最后时间)
+    chars: HashMap<(u16, String), (f64, i64)>,
 }
 
 fn code_to_string(dict: &Dict, code: &[u16]) -> String {
@@ -98,6 +107,7 @@ impl UserDb {
             fixes: HashMap::new(),
             en: HashMap::new(),
             rejects: HashMap::new(),
+            chars: HashMap::new(),
         }
     }
 
@@ -125,6 +135,10 @@ impl UserDb {
                  freq REAL NOT NULL, last INTEGER NOT NULL) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS rejected(
                  code TEXT NOT NULL, word TEXT NOT NULL, count INTEGER NOT NULL,
+                 PRIMARY KEY(code, word)) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS single_chars(
+                 code TEXT NOT NULL, word TEXT NOT NULL,
+                 freq REAL NOT NULL, last INTEGER NOT NULL,
                  PRIMARY KEY(code, word)) WITHOUT ROWID;",
         )
         .map_err(|e| format!("初始化用户词库失败：{e}"))?;
@@ -184,6 +198,17 @@ impl UserDb {
             for (code, text, n) in rows.flatten() {
                 if let Some(code) = code_from_string(dict, &code) {
                     db.rejects.insert((code, text), n);
+                }
+            }
+            let mut st = conn.prepare("SELECT code, word, freq, last FROM single_chars").map_err(|e| e.to_string())?;
+            let rows = st
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?, r.get::<_, i64>(3)?))
+                })
+                .map_err(|e| e.to_string())?;
+            for (code, text, f, l) in rows.flatten() {
+                if let (Some(id), true) = (dict.syllable_id(&code), f.is_finite() && f > 0.0) {
+                    db.chars.insert((id, text), (f, l));
                 }
             }
         }
@@ -351,6 +376,47 @@ impl UserDb {
             })();
             if ok.is_err() {
                 self.write_errors += 1;
+            }
+        }
+    }
+
+    // ---- 单字 ----
+
+    /// 单字的记忆加分（很小，要选几十次才会换位置）。
+    pub fn char_bonus(&self, syl: u16, text: &str, now: i64) -> f32 {
+        self.chars.get(&(syl, text.to_string())).map(|&(f, l)| char_bonus(effective(f, l, now))).unwrap_or(0.0)
+    }
+
+    /// 记一次单字的使用。
+    pub fn learn_char(&mut self, dict: &Dict, syl: u16, text: &str, now: i64) {
+        if text.chars().count() != 1 {
+            return;
+        }
+        let e = self.chars.entry((syl, text.to_string())).or_insert((0.0, now));
+        *e = (effective(e.0, e.1, now) + 1.0, now);
+        let (f, l) = *e;
+        if let Some(conn) = &self.conn {
+            let r = conn.execute(
+                "INSERT INTO single_chars(code, word, freq, last) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(code, word) DO UPDATE SET freq = excluded.freq, last = excluded.last",
+                params![dict.syllable(syl), text, f, l],
+            );
+            if r.is_err() {
+                self.write_errors += 1;
+            }
+        }
+        if self.chars.len() > MAX_CHAR_ENTRIES {
+            let mut v: Vec<((u16, String), f64)> =
+                self.chars.iter().map(|(k, &(f, l))| (k.clone(), effective(f, l, now))).collect();
+            v.sort_by(|a, b| a.1.total_cmp(&b.1));
+            for (k, _) in v.into_iter().take(MAX_CHAR_ENTRIES / 10) {
+                self.chars.remove(&k);
+                if let Some(conn) = &self.conn {
+                    let _ = conn.execute(
+                        "DELETE FROM single_chars WHERE code = ?1 AND word = ?2",
+                        params![dict.syllable(k.0), k.1],
+                    );
+                }
             }
         }
     }

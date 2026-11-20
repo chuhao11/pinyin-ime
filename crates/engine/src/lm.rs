@@ -12,6 +12,10 @@ use std::fs::File;
 use std::path::Path;
 
 pub const MAGIC: &[u8; 8] = b"PYIMELM1";
+/// 特殊词："前面是数字"。2010 后面打 n，"年"排第一；单独打 n 还是"你"。
+pub const NUM_TOKEN: &str = "<数字>";
+/// 特殊词："一句话（或标点后的一段）的开头"。整句转换时，没有上文就从它开始（"着"很少开头，"这"常开头）。
+pub const START_TOKEN: &str = "<句首>";
 pub const VERSION: u32 = 1;
 
 const NSEC: usize = 8;

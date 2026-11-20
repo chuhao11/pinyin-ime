@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-TAG=lm-20261120
+TAG=lm-20261120b
 GH=${GH:-gh}
 
 sha256() {
@@ -29,5 +29,5 @@ fetch() {
   echo "语言模型就绪：$out"
 }
 
-fetch pinyin.lm        c344b0e78fa22663d2b0c83cc2997c81bea666f941792092791d80618df7a6e6
-fetch pinyin-formal.lm a3a9371bf0292296bae6f6cd54e36c73dcc4fc556bbe13542329551be8575179
+fetch pinyin.lm        79d50d30ef4b5fbe31f452f0312e7e44e7944d355318d28ee8913087a0925cc2
+fetch pinyin-formal.lm c59f8caa6e6a1a4b70cebd0ca80596b2c7e43d564f1f9663e9f4a3d0531ef522

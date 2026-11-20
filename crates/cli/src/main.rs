@@ -42,6 +42,7 @@ fn main() -> ExitCode {
     let r = match args.first().map(|s| s.as_str()) {
         Some("query") => query(&args[1..]),
         Some("keys") => keys(&args[1..]),
+        Some("uni") => uni(&args[1..]),
         Some("-h") | Some("--help") => {
             println!("用法：pinyin-try [query <拼音>... | keys <按键串>]");
             Ok(())
@@ -117,6 +118,29 @@ fn query(inputs: &[String]) -> Result<(), String> {
                 if c.poor { "  (差)" } else { "" }
             );
         }
+    }
+    Ok(())
+}
+
+/// 调试：打印字词在词库里的分数和在语言模型里的单独概率。
+fn uni(words: &[String]) -> Result<(), String> {
+    let dict = open_dict()?;
+    let lm = open_lm().ok_or("没有语言模型")?;
+    let mut best: std::collections::HashMap<String, (f32, f32, String)> = std::collections::HashMap::new();
+    dict.for_each_word(|code, w| {
+        let t = dict.word_text(w);
+        if words.iter().any(|x| x == t) {
+            let py: Vec<&str> = code.iter().map(|&s| dict.syllable(s)).collect();
+            let e = best.entry(format!("{t} {}", py.join(" "))).or_insert((0.0, 0.0, String::new()));
+            *e = (dict.word_score(w), dict.word_reading(w), py.join(" "));
+        }
+    });
+    let mut v: Vec<_> = best.into_iter().collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    for (k, (sc, rd, _)) in v {
+        let t = k.split(' ').next().unwrap_or("");
+        let u = lm.id(t).map(|id| lm.uni(id)).unwrap_or(f32::NAN);
+        println!("{k}\t词库 {sc:.2}\t读音比例 {rd:.2}\t模型单独 {u:.2}\t模型+读音 {:.2}", u + rd);
     }
     Ok(())
 }

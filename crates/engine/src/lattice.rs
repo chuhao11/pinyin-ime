@@ -12,7 +12,7 @@ use std::collections::HashSet;
 
 use crate::dict::Dict;
 use crate::english::{edit_cost, match_case, max_cost, EnglishDict};
-use crate::lm::Lm;
+use crate::lm::{Lm, START_TOKEN};
 use crate::pinyin::{skip_apos, tokenize, Fix, TokKind, Token};
 use crate::userdb::{self, UserDb};
 
@@ -226,16 +226,26 @@ impl Walk {
     }
 }
 
+/// 单字的分数里，"单独打这个字的频率"（语言模型）占多少；其余是词库里的总频率（含在词里出现的）。
+const SINGLE_LM_SHARE: f32 = 0.7;
+
+/// ln(w·e^a + (1−w)·e^b)
+fn log_mix(a: f32, b: f32, w: f32) -> f32 {
+    let m = a.max(b);
+    m + (w * (a - m).exp() + (1.0 - w) * (b - m).exp()).ln()
+}
+
 /// 词的单词分数和语言模型编号。
 /// - 没有语言模型：用词库分数。
-/// - 单字：没有上文时仍按词库排（常用字、简单字优先，"是"永远在 shi 的第一位）；有上文时才看搭配。
+/// - 单字：70% 看"单独打这个字有多常见"（了 比 来 常见、你 比 那 常见），30% 看词库里的总频率。
 /// - 多字词：语言模型的概率 × 这个读音的比例；不在模型词表里的用词库分数换算。
 fn word_uni(ctx: &Ctx, text: &str, dict_score: f32, reading: f32) -> (Option<u32>, f32) {
     let Some(lm) = ctx.lm else { return (None, dict_score) };
     let id = lm.id(text);
     let single = text.chars().nth(1).is_none();
     match id {
-        _ if single => (id, dict_score),
+        Some(id) if single => (Some(id), log_mix(lm.uni(id) + reading, dict_score, SINGLE_LM_SHARE)),
+        None if single => (None, dict_score),
         Some(id) => (Some(id), lm.uni(id) + reading),
         None => (None, lm.fallback(dict_score)),
     }
@@ -436,12 +446,14 @@ pub fn analyze_with(q: &Query, input: &str) -> Vec<Candidate> {
         dfs_user(&ctx, 0, p, 0.0, &mut w, &mut hits);
         // 删掉的词不出现
         hits.retain(|h| !user.is_blocked(&h.code, hit_text(&ctx, h)));
-        // 词库里的词如果你用过，加上记忆分（单字不加）
+        // 词库里的词如果你用过，加上记忆分；单字的记忆分很小，要选几十次才会换位置
         for h in hits.iter_mut() {
             if let Src::Dict(wi) = h.src {
                 let t = dict.word_text(wi);
-                if t.chars().count() >= 2 {
+                if t.chars().nth(1).is_some() {
                     h.bonus = user.bonus(&h.code, t, now);
+                } else if h.code.len() == 1 {
+                    h.bonus = user.char_bonus(h.code[0], t, now);
                 }
             }
         }
@@ -471,7 +483,9 @@ pub fn analyze_with(q: &Query, input: &str) -> Vec<Candidate> {
 
     // ---- 整句：在词网上找分数最高的若干条路径 ----
     let mut paths: Vec<Vec<PathEnt>> = vec![Vec::new(); n + 1];
-    paths[start0].push(PathEnt { score: 0.0, prev: 0, prev_k: 0, step: Step::Start, last: q.prev });
+    // 整句从上文开始；没有上文就从"一段的开头"开始（候选列表里的单字不受影响，l 还是"了"）
+    let start_ctx = q.prev.or_else(|| lm.and_then(|l| l.id(START_TOKEN)));
+    paths[start0].push(PathEnt { score: 0.0, prev: 0, prev_k: 0, step: Step::Start, last: start_ctx });
     for p in 0..n {
         if paths[p].is_empty() {
             continue;

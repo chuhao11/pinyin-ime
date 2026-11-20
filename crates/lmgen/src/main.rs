@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
-use pinyin_engine::lm::LmBuilder;
+use pinyin_engine::lm::{LmBuilder, NUM_TOKEN, START_TOKEN};
 use pinyin_engine::Dict;
 
 const MAX_WORD_CHARS: usize = 8;
@@ -62,7 +62,7 @@ fn parse_args(v: &[String]) -> Result<Args, String> {
         wiki: None,
         out: "data/build/pinyin.lm".into(),
         eval_out: "crates/engine/tests/eval_sentences.tsv".into(),
-        max_bigrams: 20_000_000,
+        max_bigrams: 22_000_000,
         limit: None,
         chat_weight: CHAT_WEIGHT,
         wiki_weight: WIKI_WEIGHT,
@@ -114,6 +114,10 @@ struct Lex {
     code: Vec<Vec<u16>>,
     prior: Vec<f32>,
     chars: HashSet<char>,
+    /// "前面是数字"这个特殊词的编号
+    num: u32,
+    /// "一段的开头"这个特殊词的编号
+    start: u32,
 }
 
 fn build_lex(dict: &Dict) -> Lex {
@@ -132,6 +136,8 @@ fn build_lex(dict: &Dict) -> Lex {
             }
         }
     });
+    best.insert(NUM_TOKEN.to_string(), (-10.0, Vec::new()));
+    best.insert(START_TOKEN.to_string(), (-10.0, Vec::new()));
     let mut vocab: Vec<String> = best.keys().cloned().collect();
     vocab.sort();
     let mut map = HashMap::with_capacity(vocab.len());
@@ -148,7 +154,9 @@ fn build_lex(dict: &Dict) -> Lex {
             chars.insert(ch);
         }
     }
-    Lex { map, vocab, code, prior, chars }
+    let num = map[NUM_TOKEN].0;
+    let start = map[START_TOKEN].0;
+    Lex { map, vocab, code, prior, chars, num, start }
 }
 
 fn is_han(c: char) -> bool {
@@ -201,21 +209,28 @@ fn load_trad(dir: &Path) -> Result<HashMap<char, char>, String> {
 
 /// 把一段文字切成连续的汉字小段（词库里没有的字、标点、字母都当分隔）。
 fn runs<'a>(s: &'a str, lex: &Lex) -> Vec<&'a str> {
+    runs_ctx(s, lex).into_iter().map(|x| x.1).collect()
+}
+
+/// 同上，另外告诉你这一段前面紧挨着的是不是数字（"2010年"的"年"）。
+fn runs_ctx<'a>(s: &'a str, lex: &Lex) -> Vec<(bool, &'a str)> {
     let mut out = Vec::new();
-    let mut start: Option<usize> = None;
+    let mut start: Option<(usize, bool)> = None;
+    let mut prev: Option<char> = None;
     for (i, c) in s.char_indices() {
         let ok = lex.chars.contains(&c);
         match (ok, start) {
-            (true, None) => start = Some(i),
-            (false, Some(st)) => {
-                out.push(&s[st..i]);
+            (true, None) => start = Some((i, prev.is_some_and(|p| p.is_ascii_digit() || ('０'..='９').contains(&p)))),
+            (false, Some((st, d))) => {
+                out.push((d, &s[st..i]));
                 start = None;
             }
             _ => {}
         }
+        prev = Some(c);
     }
-    if let Some(st) = start {
-        out.push(&s[st..]);
+    if let Some((st, d)) = start {
+        out.push((d, &s[st..]));
     }
     out
 }
@@ -522,15 +537,22 @@ fn build(a: &Args) -> Result<(), String> {
 
     // 计数线程
     let v = lex.vocab.len();
+    let lex_ids = (lex.num, lex.start);
     let counter = thread::spawn(move || {
         let mut uni = vec![0u64; v];
         let mut bi: HashMap<u64, u32> = HashMap::with_capacity(50_000_000);
         let mut tokens = 0u64;
+        let (num, start) = lex_ids;
         for batch in seq_rx {
             for (wt, sent) in batch {
+                let after_num = sent.first() == Some(&num);
+                let _ = start;
                 for (k, &id) in sent.iter().enumerate() {
-                    uni[id as usize] += wt as u64;
-                    tokens += wt as u64;
+                    // 紧跟在数字后面的词（2010年的"年"）不算进"单独出现"的次数，只算进"数字后面"的搭配
+                    if !(after_num && k == 1) {
+                        uni[id as usize] += wt as u64;
+                        tokens += wt as u64;
+                    }
                     if k > 0 {
                         let key = ((sent[k - 1] as u64) << 32) | id as u64;
                         *bi.entry(key).or_insert(0) += wt;
@@ -557,10 +579,11 @@ fn build(a: &Args) -> Result<(), String> {
                 };
                 for t in texts {
                     let t = normalize(&t, &trad);
-                    for r in runs(&t, &lex) {
-                        let mut ids = Vec::new();
+                    for (after_digit, r) in runs_ctx(&t, &lex) {
+                        // 每一段前面加一个特殊词：数字后面的是 <数字>，其余是 <句首>
+                        let mut ids = vec![if after_digit { lex.num } else { lex.start }];
                         segment(r, &lex, &mut ids);
-                        if !ids.is_empty() {
+                        if ids.len() > 1 {
                             out.push((wt, ids));
                         }
                     }
