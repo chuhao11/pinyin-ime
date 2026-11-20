@@ -340,7 +340,7 @@ fn draw(ime: &Ime, typed: &str, user_path: &Path, ms: f64, formal: bool) -> std:
                     &mut o,
                     &mut line,
                     &format!(
-                        "矩阵：第 {}/{} 批（共 {} 个）  高亮那一行可以按 1–5 直接选",
+                        "矩阵：第 {}/{} 批（共 {} 个）  高亮那一行可以按 1–5 直接选，空格或回车上屏高亮的",
                         v.page + 1,
                         v.pages,
                         v.total

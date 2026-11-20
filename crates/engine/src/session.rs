@@ -361,8 +361,8 @@ impl Ime {
                 Response::eaten()
             }
             Key::Char(c) => self.commit_with(Some(c)),
-            Key::Space => self.select(self.hl),
-            Key::Enter => self.commit_raw(),
+            // 矩阵里回车和空格一样：上屏高亮的候选
+            Key::Space | Key::Enter => self.select(self.hl),
             Key::Backspace => {
                 self.backspace();
                 Response::eaten()
@@ -760,6 +760,20 @@ mod tests {
         let row = v.highlight / 5 * 5;
         let want = v.items[row + 2].clone();
         assert_eq!(key(&mut m, Key::Char('3')).commit, Some(want));
+    }
+
+    #[test]
+    fn enter_in_grid_selects_like_space() {
+        let mut m = ime();
+        typ(&mut m, "xian");
+        key(&mut m, Key::Char('-'));
+        key(&mut m, Key::Down);
+        let v = m.view();
+        let want = v.items[v.highlight].clone();
+        assert_eq!(key(&mut m, Key::Enter).commit, Some(want));
+        // 候选条里回车还是原样上屏字母
+        typ(&mut m, "xian");
+        assert_eq!(key(&mut m, Key::Enter).commit.as_deref(), Some("xian"));
     }
 
     #[test]
