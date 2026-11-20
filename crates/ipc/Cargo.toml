@@ -1,0 +1,12 @@
+[package]
+name = "pinyin-ipc"
+description = "输入法和引擎进程之间的通信协议"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "pinyin_ipc"
+
+[dependencies]
+pinyin-types = { path = "../types" }

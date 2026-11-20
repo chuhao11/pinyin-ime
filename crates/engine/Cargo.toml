@@ -9,5 +9,7 @@ publish.workspace = true
 name = "pinyin_engine"
 
 [dependencies]
+pinyin-types = { path = "../types" }
+pinyin-ipc = { path = "../ipc" }
 memmap2 = "0.9.12"
 rusqlite = { version = "0.43.0", features = ["bundled"] }

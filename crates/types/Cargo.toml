@@ -1,0 +1,9 @@
+[package]
+name = "pinyin-types"
+description = "输入法各部分共用的简单类型（没有任何依赖）"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "pinyin_types"

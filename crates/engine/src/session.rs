@@ -2,6 +2,10 @@
 //!
 //! 这部分和平台无关，Windows 外壳只负责把按键转给这里、把结果显示出来。
 //! 规则见 docs/方案.md 的按键表。
+//!
+//! - `Engine`：所有程序共用的东西（词库、语言模型、你的记忆、设置、中/英模式）
+//! - `Session`：每个程序（每个输入框）自己的输入状态（正在打的拼音、候选、上文）
+//! - `Ime`：一个 Engine 配一个 Session，单个程序用起来方便（试打工具、测试）
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,76 +21,7 @@ pub const CONTEXT_SECS: i64 = 30;
 pub const GRID_COLS: usize = 5;
 pub const GRID_SIZE: usize = 25;
 
-/// 按键。`Char` 是这个键实际打出的字符（已经考虑了 Shift），比如 Shift+1 是 `Char('!')`。
-/// `ShiftTap` 是"单独按一下 Shift"（按下再松开，中间没按别的键），用来切换中文 / 纯英文。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Key {
-    Char(char),
-    Space,
-    Enter,
-    Backspace,
-    Escape,
-    Left,
-    Right,
-    Up,
-    Down,
-    /// 其他键（Tab、Home、F1……）
-    Other,
-    /// 单独按一下 Shift
-    ShiftTap,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Mods {
-    pub ctrl: bool,
-    pub alt: bool,
-    pub caps_lock: bool,
-}
-
-/// 处理一个按键的结果。`consumed` 为假表示这个键原样交给程序。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Response {
-    pub consumed: bool,
-    pub commit: Option<String>,
-}
-
-impl Response {
-    fn eaten() -> Self {
-        Response { consumed: true, commit: None }
-    }
-    fn pass() -> Self {
-        Response { consumed: false, commit: None }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    /// 候选条
-    Row,
-    /// 5×5 矩阵
-    Grid,
-}
-
-/// 候选窗要显示的内容。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct View {
-    pub composing: bool,
-    /// 输入区：已选的字 + 还没转换的字母
-    pub preedit: String,
-    pub mode: Mode,
-    /// 候选条模式：这一排的候选；矩阵模式：这一页（最多 25 个，每行 5 个）
-    pub items: Vec<String>,
-    /// 高亮的是 `items` 里的第几个
-    pub highlight: usize,
-    /// 矩阵第几页、共几页
-    pub page: usize,
-    pub pages: usize,
-    pub total: usize,
-    /// 和 `items` 一一对应：这个候选是不是打错纠正出来的
-    pub corrected: Vec<bool>,
-    /// 现在是纯英文输入
-    pub english_mode: bool,
-}
+pub use pinyin_types::{Key, Mode, Mods, Response, View};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -96,11 +31,13 @@ pub struct Config {
     pub row_max: usize,
     /// 输入最多多少个字母
     pub max_input: usize,
+    /// 中文标点：打开时 ,.?! 等变成 ，。？！（默认关，全是英文符号）
+    pub chinese_punct: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { row_width: 50, row_min: 4, row_max: 8, max_input: 64 }
+        Config { row_width: 50, row_min: 4, row_max: 8, max_input: 64, chinese_punct: false }
     }
 }
 
@@ -134,17 +71,9 @@ impl Selected {
     }
 }
 
-pub struct Ime {
-    dict: Dict,
-    en: Option<EnglishDict>,
-    lm: Option<Lm>,
-    /// 上文：刚上屏的最后一个词和上屏时间。只在内存里，不保存。
-    ctx: Option<(u32, i64)>,
-    /// 纯英文输入（单按 Shift 切换）
-    english_mode: bool,
-    user: UserDb,
-    clock: Box<dyn Fn() -> i64 + Send>,
-    pub config: Config,
+/// 一个程序（输入框）自己的输入状态。
+#[derive(Default)]
+pub struct Session {
     input: String,
     consumed: usize,
     selected: Vec<Selected>,
@@ -152,6 +81,61 @@ pub struct Ime {
     row_len: usize,
     hl: usize,
     mode: Mode,
+    /// 上文：刚上屏的最后一个词和上屏时间。只在内存里，不保存。
+    ctx: Option<(u32, i64)>,
+    /// 刚打了一个数字（后面的 . , : 保持英文，比如 3.14、12:30）
+    after_digit: bool,
+    /// 中文引号是不是正开着（下一个是右引号）
+    dq_open: bool,
+    sq_open: bool,
+}
+
+impl Session {
+    pub fn new() -> Self {
+        Session::default()
+    }
+
+    pub fn is_composing(&self) -> bool {
+        !self.input.is_empty()
+    }
+
+    pub fn candidates(&self) -> &[Candidate] {
+        &self.cands
+    }
+
+    /// 忘掉上文（比如光标移走了）。
+    pub fn clear_context(&mut self) {
+        self.ctx = None;
+        self.after_digit = false;
+    }
+
+    /// 清空正在打的拼音。
+    pub fn reset(&mut self) {
+        self.input.clear();
+        self.consumed = 0;
+        self.selected.clear();
+        self.cands.clear();
+        self.cands.shrink_to(64);
+        self.row_len = 0;
+        self.hl = 0;
+        self.mode = Mode::Row;
+    }
+
+    fn remaining(&self) -> &str {
+        &self.input[self.consumed..]
+    }
+}
+
+/// 所有程序共用的部分。
+pub struct Engine {
+    dict: Dict,
+    en: Option<EnglishDict>,
+    lm: Option<Lm>,
+    user: UserDb,
+    clock: Box<dyn Fn() -> i64 + Send>,
+    pub config: Config,
+    /// 纯英文输入（单按 Shift 切换，所有程序一起）
+    english_mode: bool,
 }
 
 fn system_now() -> i64 {
@@ -162,24 +146,59 @@ pub fn display_width(s: &str) -> usize {
     s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
 }
 
-impl Ime {
+/// 中文标点。`after_digit` 时 . , : 保持英文（3.14、1,000、12:30）。
+fn zh_punct(c: char, s: &mut Session) -> Option<&'static str> {
+    if s.after_digit && matches!(c, '.' | ',' | ':') {
+        return None;
+    }
+    Some(match c {
+        ',' => "，",
+        '.' => "。",
+        '?' => "？",
+        '!' => "！",
+        ':' => "：",
+        ';' => "；",
+        '(' => "（",
+        ')' => "）",
+        '[' => "【",
+        ']' => "】",
+        '<' => "《",
+        '>' => "》",
+        '\\' => "、",
+        '^' => "……",
+        '_' => "——",
+        '$' => "￥",
+        '~' => "～",
+        '"' => {
+            s.dq_open = !s.dq_open;
+            if s.dq_open {
+                "“"
+            } else {
+                "”"
+            }
+        }
+        '\'' => {
+            s.sq_open = !s.sq_open;
+            if s.sq_open {
+                "‘"
+            } else {
+                "’"
+            }
+        }
+        _ => return None,
+    })
+}
+
+impl Engine {
     pub fn new(dict: Dict, user: UserDb) -> Self {
-        Ime {
+        Engine {
             dict,
             en: None,
             lm: None,
-            ctx: None,
-            english_mode: false,
             user,
             clock: Box::new(system_now),
             config: Config::default(),
-            input: String::new(),
-            consumed: 0,
-            selected: Vec::new(),
-            cands: Vec::new(),
-            row_len: 0,
-            hl: 0,
-            mode: Mode::Row,
+            english_mode: false,
         }
     }
 
@@ -188,7 +207,7 @@ impl Ime {
         self.en = Some(en);
     }
 
-    /// 装上语言模型。
+    /// 装上（或换掉）语言模型。
     pub fn set_lm(&mut self, lm: Lm) {
         self.lm = Some(lm);
     }
@@ -202,21 +221,16 @@ impl Ime {
     }
 
     pub fn set_english_mode(&mut self, on: bool) {
-        if on && self.is_composing() {
-            self.reset();
-        }
         self.english_mode = on;
-        self.ctx = None;
-    }
-
-    /// 忘掉上文（比如光标移走了）。
-    pub fn clear_context(&mut self) {
-        self.ctx = None;
     }
 
     /// 换一个时钟（测试用）。
     pub fn set_clock(&mut self, f: impl Fn() -> i64 + Send + 'static) {
         self.clock = Box::new(f);
+    }
+
+    pub fn now(&self) -> i64 {
+        (self.clock)()
     }
 
     pub fn dict(&self) -> &Dict {
@@ -231,22 +245,57 @@ impl Ime {
         &mut self.user
     }
 
-    pub fn is_composing(&self) -> bool {
-        !self.input.is_empty()
-    }
-
-    pub fn candidates(&self) -> &[Candidate] {
-        &self.cands
+    /// 不改变任何状态，先判断这个键会不会被输入法拿走（Windows 的 OnTestKeyDown 要用）。
+    /// 必须和 `process_key` 的结果一致。
+    pub fn would_consume(&self, s: &Session, key: Key, mods: Mods) -> bool {
+        let key = if key == Key::Char(' ') { Key::Space } else { key };
+        if key == Key::ShiftTap {
+            return true;
+        }
+        if self.english_mode || mods.ctrl || mods.alt {
+            return false;
+        }
+        if s.is_composing() {
+            return true;
+        }
+        match key {
+            Key::Char(c) if c.is_ascii_alphabetic() => !mods.caps_lock,
+            Key::Char(c) if self.config.chinese_punct => {
+                !(s.after_digit && matches!(c, '.' | ',' | ':'))
+                    && matches!(
+                        c,
+                        ',' | '.'
+                            | '?'
+                            | '!'
+                            | ':'
+                            | ';'
+                            | '('
+                            | ')'
+                            | '['
+                            | ']'
+                            | '<'
+                            | '>'
+                            | '\\'
+                            | '^'
+                            | '_'
+                            | '$'
+                            | '~'
+                            | '"'
+                            | '\''
+                    )
+            }
+            _ => false,
+        }
     }
 
     /// 处理一个按键。
-    pub fn process_key(&mut self, key: Key, mods: Mods) -> Response {
+    pub fn process_key(&mut self, s: &mut Session, key: Key, mods: Mods) -> Response {
         let key = if key == Key::Char(' ') { Key::Space } else { key };
         // 单按 Shift：中文 ↔ 纯英文。正在打拼音时，先把打的字母原样上屏
         if key == Key::ShiftTap {
-            let commit = if self.is_composing() { self.commit_raw().commit } else { None };
+            let commit = if s.is_composing() { self.commit_raw(s).commit } else { None };
             self.english_mode = !self.english_mode;
-            self.ctx = None;
+            s.clear_context();
             return Response { consumed: true, commit };
         }
         // 纯英文：所有键原样交给程序
@@ -254,84 +303,90 @@ impl Ime {
             return Response::pass();
         }
         if mods.ctrl || mods.alt {
-            self.ctx = None;
+            s.clear_context();
             return Response::pass();
         }
-        if !self.is_composing() {
+        if !s.is_composing() {
             if let Key::Char(c) = key {
                 if c.is_ascii_alphabetic() && !mods.caps_lock {
-                    self.push_char(c);
+                    self.push_char(s, c);
                     return Response::eaten();
+                }
+                // 中文标点开着：符号换成中文的
+                if self.config.chinese_punct {
+                    if let Some(p) = zh_punct(c, s) {
+                        s.clear_context();
+                        return Response { consumed: true, commit: Some(p.to_string()) };
+                    }
                 }
             }
             // 原样交给程序的键（符号、空格、回车、方向键……）：上文断开。
             // 数字例外：它是"前面是数字"这个上文（2010 后面打 n，"年"排第一）
-            self.ctx = match key {
-                Key::Char(c) if c.is_ascii_digit() => {
-                    self.lm.as_ref().and_then(|l| l.id(NUM_TOKEN)).map(|id| (id, (self.clock)()))
-                }
-                _ => None,
-            };
+            let digit = matches!(key, Key::Char(c) if c.is_ascii_digit());
+            s.ctx =
+                if digit { self.lm.as_ref().and_then(|l| l.id(NUM_TOKEN)).map(|id| (id, self.now())) } else { None };
+            s.after_digit = digit;
             return Response::pass();
         }
-        match self.mode {
-            Mode::Row => self.key_row(key),
-            Mode::Grid => self.key_grid(key),
+        match s.mode {
+            Mode::Row => self.key_row(s, key),
+            Mode::Grid => self.key_grid(s, key),
         }
     }
 
-    fn key_row(&mut self, key: Key) -> Response {
+    fn key_row(&mut self, s: &mut Session, key: Key) -> Response {
         match key {
             Key::Char(c) if c.is_ascii_alphabetic() => {
-                self.push_char(c);
+                self.push_char(s, c);
                 Response::eaten()
             }
             Key::Char('\'') => {
-                if !self.input.ends_with('\'') {
-                    self.push_char('\'');
+                if !s.input.ends_with('\'') {
+                    self.push_char(s, '\'');
                 }
                 Response::eaten()
             }
             Key::Char(d @ '1'..='9') => {
                 let i = d as usize - '1' as usize;
-                if i < self.row_len {
-                    return self.select(i);
+                if i < s.row_len {
+                    return self.select(s, i);
                 }
                 Response::eaten()
             }
             Key::Char('0') => Response::eaten(),
             Key::Char('-') => {
-                if !self.cands.is_empty() {
-                    self.mode = Mode::Grid;
+                if !s.cands.is_empty() {
+                    s.mode = Mode::Grid;
                     // 高亮停在候选条里没显示过的第一个
-                    self.hl = self.row_len.min(self.cands.len() - 1);
+                    s.hl = s.row_len.min(s.cands.len() - 1);
                 }
                 Response::eaten()
             }
-            Key::Char(c) => self.commit_with(Some(c)),
+            Key::Char(c) => self.commit_with(s, Some(c)),
             Key::Space => {
-                if self.cands.is_empty() {
-                    self.commit_with(None)
+                if s.cands.is_empty() {
+                    self.commit_with(s, None)
                 } else {
-                    self.select(self.hl)
+                    let hl = s.hl;
+                    self.select(s, hl)
                 }
             }
-            Key::Enter => self.commit_raw(),
+            Key::Enter => self.commit_raw(s),
             Key::Escape => {
-                self.reset();
+                s.reset();
                 Response::eaten()
             }
             Key::Backspace => {
-                self.backspace();
+                self.backspace(s);
                 Response::eaten()
             }
             Key::Left => {
-                self.hl = self.hl.saturating_sub(1);
+                s.hl = s.hl.saturating_sub(1);
                 Response::eaten()
             }
             Key::Right => {
-                if self.hl + 1 < self.row_len {
-                    self.hl += 1;
+                if s.hl + 1 < s.row_len {
+                    s.hl += 1;
                 }
                 Response::eaten()
             }
@@ -339,56 +394,59 @@ impl Ime {
         }
     }
 
-    fn key_grid(&mut self, key: Key) -> Response {
-        let len = self.cands.len();
+    fn key_grid(&mut self, s: &mut Session, key: Key) -> Response {
+        let len = s.cands.len();
         match key {
             Key::Char(c) if c.is_ascii_alphabetic() || c == '\'' => {
-                self.mode = Mode::Row;
-                self.key_row(key)
+                s.mode = Mode::Row;
+                self.key_row(s, key)
             }
             Key::Char(d @ '1'..='5') => {
-                let row_start = self.hl / GRID_COLS * GRID_COLS;
+                let row_start = s.hl / GRID_COLS * GRID_COLS;
                 let i = row_start + (d as usize - '1' as usize);
                 if i < len {
-                    return self.select(i);
+                    return self.select(s, i);
                 }
                 Response::eaten()
             }
             Key::Char(c) if c.is_ascii_digit() => Response::eaten(),
             Key::Char('-') | Key::Escape => {
-                self.mode = Mode::Row;
-                self.hl = 0;
+                s.mode = Mode::Row;
+                s.hl = 0;
                 Response::eaten()
             }
-            Key::Char(c) => self.commit_with(Some(c)),
+            Key::Char(c) => self.commit_with(s, Some(c)),
             // 矩阵里回车和空格一样：上屏高亮的候选
-            Key::Space | Key::Enter => self.select(self.hl),
+            Key::Space | Key::Enter => {
+                let hl = s.hl;
+                self.select(s, hl)
+            }
             Key::Backspace => {
-                self.backspace();
+                self.backspace(s);
                 Response::eaten()
             }
             Key::Left => {
-                self.hl = self.hl.saturating_sub(1);
+                s.hl = s.hl.saturating_sub(1);
                 Response::eaten()
             }
             Key::Right => {
-                if self.hl + 1 < len {
-                    self.hl += 1;
+                if s.hl + 1 < len {
+                    s.hl += 1;
                 }
                 Response::eaten()
             }
             Key::Up => {
-                if self.hl >= GRID_COLS {
-                    self.hl -= GRID_COLS;
+                if s.hl >= GRID_COLS {
+                    s.hl -= GRID_COLS;
                 }
                 Response::eaten()
             }
             Key::Down => {
-                if self.hl + GRID_COLS < len {
-                    self.hl += GRID_COLS;
-                } else if self.hl / GRID_COLS < (len - 1) / GRID_COLS {
+                if s.hl + GRID_COLS < len {
+                    s.hl += GRID_COLS;
+                } else if s.hl / GRID_COLS < (len - 1) / GRID_COLS {
                     // 下一行不满，跳到最后一个
-                    self.hl = len - 1;
+                    s.hl = len - 1;
                 }
                 Response::eaten()
             }
@@ -396,36 +454,39 @@ impl Ime {
         }
     }
 
-    fn push_char(&mut self, c: char) {
-        if self.input.len() < self.config.max_input {
-            self.input.push(c);
-            self.refresh();
+    fn push_char(&mut self, s: &mut Session, c: char) {
+        if s.input.len() < self.config.max_input {
+            s.input.push(c);
+            self.refresh(s);
         }
     }
 
-    fn remaining(&self) -> &str {
-        &self.input[self.consumed..]
-    }
-
-    fn refresh(&mut self) {
-        let now = (self.clock)();
-        let rem = &self.input[self.consumed..];
+    fn refresh(&mut self, s: &mut Session) {
+        let now = self.now();
         // 上文：这次已经选了字就用最后选的那个词，否则用刚上屏的词（30 秒内）
-        let prev = match self.selected.last() {
-            Some(s) => s.last_lm,
-            None => self.ctx.filter(|&(_, t)| now - t <= CONTEXT_SECS).map(|(id, _)| id),
+        let prev = match s.selected.last() {
+            Some(x) => x.last_lm,
+            None => s.ctx.filter(|&(_, t)| now - t <= CONTEXT_SECS).map(|(id, _)| id),
         };
         let q = Query { dict: &self.dict, en: self.en.as_ref(), lm: self.lm.as_ref(), user: &self.user, prev, now };
-        self.cands = if rem.is_empty() { Vec::new() } else { analyze_with(&q, rem) };
-        self.row_len = self.compute_row_len();
-        self.hl = 0;
-        self.mode = Mode::Row;
+        let cands = {
+            let rem = s.remaining();
+            if rem.is_empty() {
+                Vec::new()
+            } else {
+                analyze_with(&q, rem)
+            }
+        };
+        s.cands = cands;
+        s.row_len = self.compute_row_len(&s.cands);
+        s.hl = 0;
+        s.mode = Mode::Row;
     }
 
-    fn compute_row_len(&self) -> usize {
+    fn compute_row_len(&self, cands: &[Candidate]) -> usize {
         let cfg = &self.config;
         let (mut width, mut k) = (0usize, 0usize);
-        for c in &self.cands {
+        for c in cands {
             if k >= cfg.row_max || (k > 0 && c.poor) {
                 break;
             }
@@ -439,24 +500,24 @@ impl Ime {
         k
     }
 
-    fn select(&mut self, i: usize) -> Response {
-        let Some(c) = self.cands.get(i).cloned() else { return Response::eaten() };
-        self.note_rejection(&c);
-        self.take(c);
-        if self.consumed >= self.input.len() {
-            self.finish(None)
+    fn select(&mut self, s: &mut Session, i: usize) -> Response {
+        let Some(c) = s.cands.get(i).cloned() else { return Response::eaten() };
+        self.note_rejection(s, &c);
+        self.take(s, c);
+        if s.consumed >= s.input.len() {
+            self.finish(s, None)
         } else {
-            self.refresh();
+            self.refresh(s);
             Response::eaten()
         }
     }
 
     /// 你选的多字词不是"本来该排第一"的那个：给那个词记一次冷落（单字不算）。
-    fn note_rejection(&mut self, chosen: &Candidate) {
+    fn note_rejection(&mut self, s: &Session, chosen: &Candidate) {
         if !matches!(chosen.kind, CandKind::Word | CandKind::Sentence) || chosen.text.chars().count() < 2 {
             return;
         }
-        let top = self
+        let top = s
             .cands
             .iter()
             .filter(|c| matches!(c.kind, CandKind::Word | CandKind::Sentence) && c.consumed == chosen.consumed)
@@ -468,24 +529,23 @@ impl Ime {
                 && t.fixes.is_empty()
                 && !t.code.is_empty()
             {
-                let (code, text) = (t.code.clone(), t.text.clone());
-                self.user.reject(&self.dict, &code, &text);
+                self.user.reject(&self.dict, &t.code, &t.text);
             }
         }
     }
 
     /// 把一个候选放进"已选"，往后移动输入位置。
-    fn take(&mut self, c: Candidate) {
-        let start = self.consumed;
+    fn take(&mut self, s: &mut Session, c: Candidate) {
+        let start = s.consumed;
         match c.kind {
             CandKind::Raw | CandKind::English => {
-                let mut s = Selected::plain(start, c.text);
-                s.english = c.kind == CandKind::English || s.text.len() >= 3;
-                self.selected.push(s);
-                self.consumed = self.input.len();
+                let mut x = Selected::plain(start, c.text);
+                x.english = c.kind == CandKind::English || x.text.len() >= 3;
+                s.selected.push(x);
+                s.consumed = s.input.len();
             }
             _ => {
-                self.selected.push(Selected {
+                s.selected.push(Selected {
                     start,
                     text: c.text,
                     code: c.code,
@@ -495,129 +555,127 @@ impl Ime {
                     english: false,
                     last_lm: c.last_lm,
                 });
-                self.consumed = skip_apos(self.input.as_bytes(), start + c.consumed).min(self.input.len());
+                s.consumed = skip_apos(s.input.as_bytes(), start + c.consumed).min(s.input.len());
             }
         }
     }
 
-    /// 上屏全部已选的字，记住用过的词，然后清空。
-    fn finish(&mut self, extra: Option<char>) -> Response {
-        let now = (self.clock)();
-        let mut text: String = self.selected.iter().map(|s| s.text.as_str()).collect();
-        for s in &self.selected {
-            if s.learnable && !s.code.is_empty() {
-                self.user.learn(&self.dict, &s.code, &s.text, now);
+    /// 上屏全部已选的字，记住用过的词，然后清空。`extra` 是跟在后面的符号。
+    fn finish(&mut self, s: &mut Session, extra: Option<String>) -> Response {
+        let now = self.now();
+        let mut text: String = s.selected.iter().map(|x| x.text.as_str()).collect();
+        for x in &s.selected {
+            if x.learnable && !x.code.is_empty() {
+                self.user.learn(&self.dict, &x.code, &x.text, now);
             }
             // 单字：慢慢记（选几十次才会换位置）
-            if s.code.len() == 1 && s.text.chars().count() == 1 {
-                self.user.learn_char(&self.dict, s.code[0], &s.text, now);
+            if x.code.len() == 1 && x.text.chars().count() == 1 {
+                self.user.learn_char(&self.dict, x.code[0], &x.text, now);
             }
             // 打错被纠正了：记住这种错法，下次同样的错扣分更少
-            for f in &s.fixes {
+            for f in &x.fixes {
                 let (a, b) = f.key();
                 self.user.learn_fix(&a, &b, now);
             }
             // 再记住"这样打错就是想要这个词"，下次一模一样的错直接排第一
-            if let Some(tc) = &s.typed_code {
-                self.user.learn(&self.dict, tc, &s.text, now);
+            if let Some(tc) = &x.typed_code {
+                self.user.learn(&self.dict, tc, &x.text, now);
             }
-            if s.english {
-                self.user.learn_en(&s.text, now);
+            if x.english {
+                self.user.learn_en(&x.text, now);
             }
         }
         // 分几次选出来的，合起来存成一个新词（比如人名）
-        if self.selected.len() >= 2 && self.selected.iter().all(|s| s.learnable && !s.code.is_empty()) {
+        if s.selected.len() >= 2 && s.selected.iter().all(|x| x.learnable && !x.code.is_empty()) {
             let n = text.chars().count();
             if (2..=8).contains(&n) {
-                let code: Vec<u16> = self.selected.iter().flat_map(|s| s.code.iter().copied()).collect();
+                let code: Vec<u16> = s.selected.iter().flat_map(|x| x.code.iter().copied()).collect();
                 self.user.learn(&self.dict, &code, &text, now);
             }
         }
         // 记下上文给下一次输入用；后面跟了符号就算断句
-        self.ctx = match (extra, self.selected.last().and_then(|s| s.last_lm)) {
+        s.ctx = match (&extra, s.selected.last().and_then(|x| x.last_lm)) {
             (None, Some(id)) => Some((id, now)),
             _ => None,
         };
-        if let Some(c) = extra {
-            text.push(c);
+        s.after_digit = false;
+        if let Some(e) = extra {
+            text.push_str(&e);
         }
-        self.reset();
+        s.reset();
         Response { consumed: true, commit: Some(text) }
     }
 
     /// 按了符号（或者没有候选时按空格）：先上屏高亮的候选，再输出符号。
-    fn commit_with(&mut self, sym: Option<char>) -> Response {
-        let rem = self.remaining().len();
+    fn commit_with(&mut self, s: &mut Session, sym: Option<char>) -> Response {
+        let rem = s.remaining().len();
         if rem > 0 {
             let covers = |c: &Candidate| c.consumed >= rem;
-            let pick = match self.cands.get(self.hl) {
+            let pick = match s.cands.get(s.hl) {
                 Some(c) if covers(c) => Some(c.clone()),
-                _ => self.cands.first().filter(|c| covers(c)).cloned(),
+                _ => s.cands.first().filter(|c| covers(c)).cloned(),
             };
             match pick {
-                Some(c) => self.take(c),
+                Some(c) => self.take(s, c),
                 None => {
-                    let raw = self.remaining().to_string();
-                    let start = self.consumed;
-                    self.selected.push(Selected::plain(start, raw));
-                    self.consumed = self.input.len();
+                    let raw = s.remaining().to_string();
+                    let start = s.consumed;
+                    s.selected.push(Selected::plain(start, raw));
+                    s.consumed = s.input.len();
                 }
             }
         }
-        self.finish(sym)
+        let extra = sym.map(|c| {
+            if self.config.chinese_punct {
+                if let Some(p) = zh_punct(c, s) {
+                    return p.to_string();
+                }
+            }
+            c.to_string()
+        });
+        self.finish(s, extra)
     }
 
     /// 回车：已选的字 + 剩下的字母原样上屏。
-    fn commit_raw(&mut self) -> Response {
-        let mut text: String = self.selected.iter().map(|s| s.text.as_str()).collect();
-        text.push_str(self.remaining());
-        self.ctx = None;
-        self.reset();
+    fn commit_raw(&mut self, s: &mut Session) -> Response {
+        let mut text: String = s.selected.iter().map(|x| x.text.as_str()).collect();
+        text.push_str(s.remaining());
+        s.clear_context();
+        s.reset();
         Response { consumed: true, commit: Some(text) }
     }
 
-    fn backspace(&mut self) {
-        if self.input.len() > self.consumed {
-            self.input.pop();
-        } else if let Some(s) = self.selected.pop() {
-            self.consumed = s.start;
+    fn backspace(&mut self, s: &mut Session) {
+        if s.input.len() > s.consumed {
+            s.input.pop();
+        } else if let Some(x) = s.selected.pop() {
+            s.consumed = x.start;
         }
-        if self.input.is_empty() {
-            self.reset();
+        if s.input.is_empty() {
+            s.reset();
         } else {
-            self.refresh();
+            self.refresh(s);
         }
     }
 
-    pub fn reset(&mut self) {
-        self.input.clear();
-        self.consumed = 0;
-        self.selected.clear();
-        self.cands.clear();
-        self.cands.shrink_to(64);
-        self.row_len = 0;
-        self.hl = 0;
-        self.mode = Mode::Row;
-    }
-
-    pub fn view(&self) -> View {
-        let mut preedit: String = self.selected.iter().map(|s| s.text.as_str()).collect();
-        preedit.push_str(self.remaining());
-        let total = self.cands.len();
-        let (range, highlight, page, pages) = match self.mode {
-            Mode::Row => (0..self.row_len, self.hl.min(self.row_len.saturating_sub(1)), 0, 1),
+    pub fn view(&self, s: &Session) -> View {
+        let mut preedit: String = s.selected.iter().map(|x| x.text.as_str()).collect();
+        preedit.push_str(s.remaining());
+        let total = s.cands.len();
+        let (range, highlight, page, pages) = match s.mode {
+            Mode::Row => (0..s.row_len, s.hl.min(s.row_len.saturating_sub(1)), 0, 1),
             Mode::Grid => {
-                let page = self.hl / GRID_SIZE;
+                let page = s.hl / GRID_SIZE;
                 let start = page * GRID_SIZE;
                 let end = (start + GRID_SIZE).min(total);
-                (start..end, self.hl - start, page, total.div_ceil(GRID_SIZE))
+                (start..end, s.hl - start, page, total.div_ceil(GRID_SIZE))
             }
         };
-        let shown = &self.cands[range];
+        let shown = &s.cands[range];
         View {
-            composing: self.is_composing(),
+            composing: s.is_composing(),
             preedit,
-            mode: self.mode,
+            mode: s.mode,
             items: shown.iter().map(|c| c.text.clone()).collect(),
             highlight,
             page,
@@ -626,6 +684,94 @@ impl Ime {
             corrected: shown.iter().map(|c| c.corrected()).collect(),
             english_mode: self.english_mode,
         }
+    }
+}
+
+/// 一个 Engine 配一个 Session：单个程序用（试打工具、测试）。
+pub struct Ime {
+    engine: Engine,
+    session: Session,
+}
+
+impl Ime {
+    pub fn new(dict: Dict, user: UserDb) -> Self {
+        Ime { engine: Engine::new(dict, user), session: Session::new() }
+    }
+
+    pub fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
+    pub fn engine_mut(&mut self) -> &mut Engine {
+        &mut self.engine
+    }
+
+    pub fn set_english(&mut self, en: EnglishDict) {
+        self.engine.set_english(en);
+    }
+
+    pub fn set_lm(&mut self, lm: Lm) {
+        self.engine.set_lm(lm);
+    }
+
+    pub fn lm(&self) -> Option<&Lm> {
+        self.engine.lm()
+    }
+
+    pub fn english_mode(&self) -> bool {
+        self.engine.english_mode()
+    }
+
+    pub fn set_english_mode(&mut self, on: bool) {
+        if on && self.session.is_composing() {
+            self.session.reset();
+        }
+        self.engine.set_english_mode(on);
+        self.session.clear_context();
+    }
+
+    pub fn clear_context(&mut self) {
+        self.session.clear_context();
+    }
+
+    pub fn set_clock(&mut self, f: impl Fn() -> i64 + Send + 'static) {
+        self.engine.set_clock(f);
+    }
+
+    pub fn dict(&self) -> &Dict {
+        self.engine.dict()
+    }
+
+    pub fn user(&self) -> &UserDb {
+        self.engine.user()
+    }
+
+    pub fn user_mut(&mut self) -> &mut UserDb {
+        self.engine.user_mut()
+    }
+
+    pub fn is_composing(&self) -> bool {
+        self.session.is_composing()
+    }
+
+    pub fn candidates(&self) -> &[Candidate] {
+        self.session.candidates()
+    }
+
+    pub fn process_key(&mut self, key: Key, mods: Mods) -> Response {
+        self.engine.process_key(&mut self.session, key, mods)
+    }
+
+    pub fn would_consume(&self, key: Key, mods: Mods) -> bool {
+        self.engine.would_consume(&self.session, key, mods)
+    }
+
+    pub fn reset(&mut self) {
+        self.session.reset();
+    }
+
+    pub fn view(&self) -> View {
+        self.engine.view(&self.session)
     }
 }
 
@@ -760,6 +906,67 @@ mod tests {
         let row = v.highlight / 5 * 5;
         let want = v.items[row + 2].clone();
         assert_eq!(key(&mut m, Key::Char('3')).commit, Some(want));
+    }
+
+    #[test]
+    fn chinese_punctuation_switch() {
+        let mut m = ime();
+        m.engine_mut().config.chinese_punct = true;
+        assert_eq!(key(&mut m, Key::Char(',')).commit.as_deref(), Some("，"));
+        assert_eq!(typ(&mut m, "nihao,"), "你好，");
+        assert_eq!(typ(&mut m, "nihao?"), "你好？");
+        // 引号一左一右
+        assert_eq!(key(&mut m, Key::Char('"')).commit.as_deref(), Some("“"));
+        assert_eq!(key(&mut m, Key::Char('"')).commit.as_deref(), Some("”"));
+        // 数字后面的小数点、冒号保持英文
+        assert_eq!(key(&mut m, Key::Char('3')), Response::pass());
+        assert_eq!(key(&mut m, Key::Char('.')), Response::pass());
+        // 空格永远是半角，原样交给程序
+        assert_eq!(key(&mut m, Key::Space), Response::pass());
+        // 关掉以后全是英文
+        m.engine_mut().config.chinese_punct = false;
+        assert_eq!(key(&mut m, Key::Char(',')), Response::pass());
+        assert_eq!(typ(&mut m, "nihao,"), "你好,");
+    }
+
+    #[test]
+    fn would_consume_matches_process_key() {
+        // Windows 先问"这个键要不要"，再真的处理，两边的答案必须一样
+        let mut m = ime();
+        let keys = [
+            Key::Char('n'),
+            Key::Char('i'),
+            Key::Char(','),
+            Key::Char('3'),
+            Key::Char('.'),
+            Key::Char('-'),
+            Key::Char('2'),
+            Key::Char('\''),
+            Key::Space,
+            Key::Enter,
+            Key::Backspace,
+            Key::Escape,
+            Key::Left,
+            Key::Down,
+            Key::ShiftTap,
+            Key::Char('X'),
+            Key::Other,
+        ];
+        let mut x: u64 = 12345;
+        for step in 0..5000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = keys[(x % keys.len() as u64) as usize];
+            let mods = Mods { ctrl: step % 97 == 0, alt: false, caps_lock: step % 211 == 0 };
+            if step % 500 == 0 {
+                let p = m.engine().config.chinese_punct;
+                m.engine_mut().config.chinese_punct = !p;
+            }
+            let predicted = m.would_consume(k, mods);
+            let actual = m.process_key(k, mods).consumed;
+            assert_eq!(predicted, actual, "第 {step} 步，按键 {k:?}，{mods:?}");
+        }
     }
 
     #[test]
