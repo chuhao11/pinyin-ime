@@ -1,0 +1,5 @@
+/target/
+/data/raw/
+/data/build/
+*.part
+.DS_Store

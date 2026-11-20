@@ -1,0 +1,59 @@
+# 打字回归测试：输入<Tab>应该出现的字词<Tab>必须排在前几位
+# 每次改动都跑一遍，防止越改越差。改排序规则后如果这里失败，先想清楚是规则错了还是期望错了。
+
+# 单字：常用字在第一
+shi	是	1
+yi	一	1
+de	的	1
+le	了	1
+xian	先	1
+ni	你	1
+wo	我	1
+
+# 不打分隔符也能选到的词
+xian	西安	5
+fangan	方案	1
+fangan	反感	2
+dangan	档案	1
+dangan	单干	5
+qie	企鹅	5
+piao	皮袄	5
+tiananmen	天安门	1
+xi'an	西安	1
+
+# 简拼、混拼、边打边出
+zg	中国	8
+zgr	中国人	1
+sjk	数据库	1
+zhongg	中国	1
+zhonggu	中国	1
+zhongguo	中国	1
+
+# 常用词
+nihao	你好	1
+nihaoma	你好吗	1
+women	我们	1
+shiqing	事情	1
+xiexie	谢谢	1
+duibuqi	对不起	1
+meiguanxi	没关系	1
+zhidao	知道	1
+keyi	可以	1
+xihuan	喜欢	1
+pengyou	朋友	1
+dianhua	电话	1
+diannao	电脑	1
+shouji	手机	1
+jisuanji	计算机	1
+xuexiao	学校	1
+gongzuo	工作	1
+
+# 整句
+jintiantianqizhenhao	今天天气真好	1
+woxianzaiqushangban	我现在去上班	1
+wodemingzi	我的名字	1
+
+# 其他写法
+lve	略	1
+lue	略	1
+nvren	女人	1

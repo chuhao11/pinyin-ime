@@ -1,0 +1,55 @@
+name: 编译和测试
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 缓存词库源数据
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: data/raw
+          key: raw-${{ hashFiles('tools/fetch-data.sh') }}
+
+      - name: 下载词库源数据（固定版本 + 校验码）
+        shell: bash
+        run: tools/fetch-data.sh
+
+      - name: 准备 Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          rustc --version
+
+      - name: 检查格式和代码规范
+        shell: bash
+        run: |
+          cargo fmt --all --check
+          cargo clippy --release --workspace --all-targets -- -D warnings
+
+      - name: 编译词库
+        shell: bash
+        run: cargo run --release -p dictgen
+
+      - name: 测试（包括打字回归测试和长时间内存测试）
+        shell: bash
+        env:
+          REQUIRE_DICT: "1"
+        run: cargo test --release --workspace -- --nocapture

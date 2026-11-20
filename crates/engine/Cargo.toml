@@ -1,0 +1,13 @@
+[package]
+name = "pinyin-engine"
+description = "拼音输入法引擎核心：切分、查词、排序、记忆、按键规则"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "pinyin_engine"
+
+[dependencies]
+memmap2 = "0.9.12"
+rusqlite = { version = "0.43.0", features = ["bundled"] }

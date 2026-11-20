@@ -1,0 +1,9 @@
+[package]
+name = "dictgen"
+description = "词库编译工具"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+pinyin-engine = { path = "../engine" }

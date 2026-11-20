@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/engine", "crates/dictgen", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+debug = 1
