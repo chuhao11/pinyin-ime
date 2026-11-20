@@ -14,7 +14,7 @@ use std::time::Instant;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::{cursor, execute, queue, terminal};
-use pinyin_engine::{Dict, EnglishDict, Ime, Key, Mode, Mods, UserDb, GRID_COLS};
+use pinyin_engine::{Dict, EnglishDict, Ime, Key, Lm, Mode, Mods, Query, UserDb, GRID_COLS};
 
 fn find_dict() -> Result<PathBuf, String> {
     if let Ok(p) = std::env::var("PINYIN_DICT") {
@@ -68,10 +68,26 @@ fn open_english() -> Option<EnglishDict> {
     EnglishDict::load(&p).ok()
 }
 
+/// 语言模型也在同一个文件夹：日常 pinyin.lm，书面 pinyin-formal.lm；没有就不用。
+fn open_lm_style(formal: bool) -> Option<Lm> {
+    let name = if formal { "pinyin-formal.lm" } else { "pinyin.lm" };
+    let p = find_dict().ok()?.with_file_name(name);
+    Lm::open(&p).ok()
+}
+
+fn open_lm() -> Option<Lm> {
+    open_lm_style(std::env::var("PINYIN_FORMAL").is_ok())
+}
+
 fn new_ime(dict: Dict, user: UserDb) -> Ime {
     let mut ime = Ime::new(dict, user);
     if let Some(en) = open_english() {
         ime.set_english(en);
+    }
+    if std::env::var("PINYIN_NO_LM").is_err() {
+        if let Some(lm) = open_lm() {
+            ime.set_lm(lm);
+        }
     }
     ime
 }
@@ -79,10 +95,12 @@ fn new_ime(dict: Dict, user: UserDb) -> Ime {
 fn query(inputs: &[String]) -> Result<(), String> {
     let dict = open_dict()?;
     let en = open_english();
+    let lm = if std::env::var("PINYIN_NO_LM").is_ok() { None } else { open_lm() };
     let user = UserDb::in_memory();
     for input in inputs {
         let t = Instant::now();
-        let cands = pinyin_engine::lattice::analyze(&dict, en.as_ref(), &user, input, 0);
+        let q = Query { dict: &dict, en: en.as_ref(), lm: lm.as_ref(), user: &user, prev: None, now: 0 };
+        let cands = pinyin_engine::analyze_with(&q, input);
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         println!("== {input}（{} 个候选，{ms:.2} 毫秒）", cands.len());
         for (i, c) in cands.iter().take(30).enumerate() {
@@ -118,6 +136,7 @@ fn parse_keys(s: &str) -> Result<Vec<Key>, String> {
             }
             out.push(match name.as_str() {
                 "space" => Key::Space,
+                "shift" => Key::ShiftTap,
                 "enter" => Key::Enter,
                 "bs" => Key::Backspace,
                 "esc" => Key::Escape,
@@ -194,8 +213,9 @@ fn interactive() -> Result<(), String> {
     let _guard = TermGuard;
     execute!(stdout(), terminal::EnterAlternateScreen, cursor::Hide).map_err(|e| e.to_string())?;
     let mut last_ms = 0.0;
+    let mut formal = std::env::var("PINYIN_FORMAL").is_ok();
     loop {
-        draw(&ime, &typed, &up, last_ms).map_err(|e| e.to_string())?;
+        draw(&ime, &typed, &up, last_ms, formal).map_err(|e| e.to_string())?;
         let ev = event::read().map_err(|e| e.to_string())?;
         let Event::Key(ke) = ev else { continue };
         if ke.kind == KeyEventKind::Release {
@@ -209,7 +229,18 @@ fn interactive() -> Result<(), String> {
             typed.clear();
             continue;
         }
+        // Ctrl+T：日常 / 书面 切换
+        if ctrl && ke.code == KeyCode::Char('t') {
+            formal = !formal;
+            match open_lm_style(formal) {
+                Some(lm) => ime.set_lm(lm),
+                None => formal = !formal,
+            }
+            continue;
+        }
         let key = match ke.code {
+            // 终端收不到"单按 Shift"，用 Tab 代替
+            KeyCode::Tab => Key::ShiftTap,
             KeyCode::Char(c) => Key::Char(c),
             KeyCode::Enter => Key::Enter,
             KeyCode::Backspace => Key::Backspace,
@@ -229,7 +260,7 @@ fn interactive() -> Result<(), String> {
     Ok(())
 }
 
-fn draw(ime: &Ime, typed: &str, user_path: &Path, ms: f64) -> std::io::Result<()> {
+fn draw(ime: &Ime, typed: &str, user_path: &Path, ms: f64, formal: bool) -> std::io::Result<()> {
     let mut o = stdout();
     queue!(o, terminal::Clear(terminal::ClearType::All), cursor::MoveTo(0, 0))?;
     let mut line = 0u16;
@@ -239,6 +270,17 @@ fn draw(ime: &Ime, typed: &str, user_path: &Path, ms: f64) -> std::io::Result<()
         Ok(())
     }
     put_line(&mut o, &mut line, "拼音输入法 · 试打工具        Ctrl+C 退出    Ctrl+L 清空下面打出的文字")?;
+    let mode = if ime.view().english_mode { "英（纯英文）" } else { "中" };
+    let style = match (ime.lm().is_some(), formal) {
+        (false, _) => "没有语言模型",
+        (true, false) => "日常",
+        (true, true) => "书面",
+    };
+    put_line(
+        &mut o,
+        &mut line,
+        &format!("现在：{mode} · {style}        Tab = 单按 Shift（中/英切换）    Ctrl+T = 日常/书面切换"),
+    )?;
     put_line(
         &mut o,
         &mut line,

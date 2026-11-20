@@ -177,6 +177,8 @@ fn same_typo_is_remembered() {
         typ(&mut fresh, "xuhuan");
         fresh.candidates().iter().find(|c| c.text == "喜欢").map(|c| c.score)
     };
+    // 去掉上文（刚上屏的"希望"），只比较纠错扣分的变化
+    ime.clear_context();
     typ(&mut ime, "xuhuan");
     let after = ime.candidates().iter().find(|c| c.text == "喜欢").map(|c| c.score);
     assert!(after.unwrap() > before.unwrap(), "{before:?} → {after:?}");

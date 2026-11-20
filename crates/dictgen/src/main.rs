@@ -295,13 +295,19 @@ fn run() -> Result<(), String> {
     let total: u64 = chars.iter().map(|x| x.2).sum::<u64>() + words.iter().map(|w| w.weight).sum::<u64>();
     let ln_total = (total as f64).ln();
 
+    // 每个字的各个读音的权重加起来（用来算"这个读音占多少"）
+    let mut char_total: HashMap<char, f64> = HashMap::new();
+    for (c, _, w) in &chars {
+        *char_total.entry(*c).or_insert(0.0) += *w as f64 + 1.0;
+    }
     let mut n_chars = 0usize;
     for (c, py, w) in &chars {
         let Some(code) = b.code(py) else { continue };
         let i = info.get(c).copied().unwrap_or(CharInfo { tier: 4, strokes: 30 });
         let t = if char_table.contains(c) && i.tier == 4 { 4 } else { i.tier.clamp(1, 4) };
         let score = ((*w as f64) + 1.0).ln() - ln_total + CHAR_PEN[t as usize] + STROKE_PEN * i.strokes as f64;
-        b.add(&code, &c.to_string(), score as f32);
+        let reading = ((*w as f64 + 1.0) / char_total[c]).ln();
+        b.add_with_reading(&code, &c.to_string(), score as f32, reading as f32);
         n_chars += 1;
     }
 
@@ -326,6 +332,13 @@ fn run() -> Result<(), String> {
     }
     let mut n_words = 0usize;
     let mut bad_pinyin = 0usize;
+    // 按固定顺序加入，保证每次编译出来的文件一模一样
+    let mut seen: Vec<((String, String), u64)> = seen.into_iter().collect();
+    let mut word_total: HashMap<String, f64> = HashMap::new();
+    for ((text, _), w) in &seen {
+        *word_total.entry(text.clone()).or_insert(0.0) += *w as f64 + 1.0;
+    }
+    seen.sort();
     for ((text, py), weight) in &seen {
         let Some(code) = b.code(py) else {
             bad_pinyin += 1;
@@ -336,7 +349,8 @@ fn run() -> Result<(), String> {
         }
         let pen: f64 = text.chars().filter(|c| is_han(*c)).map(|c| WORD_PEN[tier(c).clamp(1, 4) as usize]).sum();
         let score = ((*weight as f64) + 1.0).ln() - ln_total + pen;
-        b.add(&code, text, score as f32);
+        let reading = ((*weight as f64 + 1.0) / word_total[text]).ln();
+        b.add_with_reading(&code, text, score as f32, reading as f32);
         n_words += 1;
     }
 

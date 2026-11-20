@@ -38,6 +38,14 @@ pub fn real_ime(user: UserDb) -> Option<Ime> {
     if let Some(en) = real_english() {
         ime.set_english(en);
     }
+    if std::env::var("PINYIN_NO_LM").is_err() {
+        let p = std::env::var("PINYIN_DICT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/build/pinyin.dict"));
+        if let Ok(lm) = pinyin_engine::Lm::open(&p.with_file_name("pinyin.lm")) {
+            ime.set_lm(lm);
+        }
+    }
     ime.set_clock(|| 1_800_000_000);
     Some(ime)
 }

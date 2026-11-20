@@ -7,15 +7,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::dict::Dict;
 use crate::english::EnglishDict;
-use crate::lattice::{analyze, CandKind, Candidate};
+use crate::lattice::{analyze_with, CandKind, Candidate, Query};
+use crate::lm::Lm;
 use crate::pinyin::{skip_apos, Fix};
 use crate::userdb::UserDb;
 
+/// 上文（刚上屏的词）多久以内还算数。
+pub const CONTEXT_SECS: i64 = 30;
 pub const GRID_COLS: usize = 5;
 pub const GRID_SIZE: usize = 25;
 
 /// 按键。`Char` 是这个键实际打出的字符（已经考虑了 Shift），比如 Shift+1 是 `Char('!')`。
-/// 单按 Shift 不需要传进来（它不做任何事）。
+/// `ShiftTap` 是"单独按一下 Shift"（按下再松开，中间没按别的键），用来切换中文 / 纯英文。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
     Char(char),
@@ -29,6 +32,8 @@ pub enum Key {
     Down,
     /// 其他键（Tab、Home、F1……）
     Other,
+    /// 单独按一下 Shift
+    ShiftTap,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -79,6 +84,8 @@ pub struct View {
     pub total: usize,
     /// 和 `items` 一一对应：这个候选是不是打错纠正出来的
     pub corrected: Vec<bool>,
+    /// 现在是纯英文输入
+    pub english_mode: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -108,6 +115,8 @@ struct Selected {
     typed_code: Option<Vec<u16>>,
     /// 英文词（或原样的字母），上屏后记进英文词表
     english: bool,
+    /// 最后一个词在语言模型里的编号
+    last_lm: Option<u32>,
 }
 
 impl Selected {
@@ -120,6 +129,7 @@ impl Selected {
             fixes: Vec::new(),
             typed_code: None,
             english: false,
+            last_lm: None,
         }
     }
 }
@@ -127,6 +137,11 @@ impl Selected {
 pub struct Ime {
     dict: Dict,
     en: Option<EnglishDict>,
+    lm: Option<Lm>,
+    /// 上文：刚上屏的最后一个词和上屏时间。只在内存里，不保存。
+    ctx: Option<(u32, i64)>,
+    /// 纯英文输入（单按 Shift 切换）
+    english_mode: bool,
     user: UserDb,
     clock: Box<dyn Fn() -> i64 + Send>,
     pub config: Config,
@@ -152,6 +167,9 @@ impl Ime {
         Ime {
             dict,
             en: None,
+            lm: None,
+            ctx: None,
+            english_mode: false,
             user,
             clock: Box::new(system_now),
             config: Config::default(),
@@ -168,6 +186,32 @@ impl Ime {
     /// 装上英文词表。
     pub fn set_english(&mut self, en: EnglishDict) {
         self.en = Some(en);
+    }
+
+    /// 装上语言模型。
+    pub fn set_lm(&mut self, lm: Lm) {
+        self.lm = Some(lm);
+    }
+
+    pub fn lm(&self) -> Option<&Lm> {
+        self.lm.as_ref()
+    }
+
+    pub fn english_mode(&self) -> bool {
+        self.english_mode
+    }
+
+    pub fn set_english_mode(&mut self, on: bool) {
+        if on && self.is_composing() {
+            self.reset();
+        }
+        self.english_mode = on;
+        self.ctx = None;
+    }
+
+    /// 忘掉上文（比如光标移走了）。
+    pub fn clear_context(&mut self) {
+        self.ctx = None;
     }
 
     /// 换一个时钟（测试用）。
@@ -198,7 +242,19 @@ impl Ime {
     /// 处理一个按键。
     pub fn process_key(&mut self, key: Key, mods: Mods) -> Response {
         let key = if key == Key::Char(' ') { Key::Space } else { key };
+        // 单按 Shift：中文 ↔ 纯英文。正在打拼音时，先把打的字母原样上屏
+        if key == Key::ShiftTap {
+            let commit = if self.is_composing() { self.commit_raw().commit } else { None };
+            self.english_mode = !self.english_mode;
+            self.ctx = None;
+            return Response { consumed: true, commit };
+        }
+        // 纯英文：所有键原样交给程序
+        if self.english_mode {
+            return Response::pass();
+        }
         if mods.ctrl || mods.alt {
+            self.ctx = None;
             return Response::pass();
         }
         if !self.is_composing() {
@@ -208,6 +264,8 @@ impl Ime {
                     return Response::eaten();
                 }
             }
+            // 原样交给程序的键（符号、空格、回车、方向键……）：上文断开
+            self.ctx = None;
             return Response::pass();
         }
         match self.mode {
@@ -271,7 +329,7 @@ impl Ime {
                 }
                 Response::eaten()
             }
-            Key::Up | Key::Down | Key::Other => Response::eaten(),
+            Key::Up | Key::Down | Key::Other | Key::ShiftTap => Response::eaten(),
         }
     }
 
@@ -328,7 +386,7 @@ impl Ime {
                 }
                 Response::eaten()
             }
-            Key::Other => Response::eaten(),
+            Key::Other | Key::ShiftTap => Response::eaten(),
         }
     }
 
@@ -346,8 +404,13 @@ impl Ime {
     fn refresh(&mut self) {
         let now = (self.clock)();
         let rem = &self.input[self.consumed..];
-        self.cands =
-            if rem.is_empty() { Vec::new() } else { analyze(&self.dict, self.en.as_ref(), &self.user, rem, now) };
+        // 上文：这次已经选了字就用最后选的那个词，否则用刚上屏的词（30 秒内）
+        let prev = match self.selected.last() {
+            Some(s) => s.last_lm,
+            None => self.ctx.filter(|&(_, t)| now - t <= CONTEXT_SECS).map(|(id, _)| id),
+        };
+        let q = Query { dict: &self.dict, en: self.en.as_ref(), lm: self.lm.as_ref(), user: &self.user, prev, now };
+        self.cands = if rem.is_empty() { Vec::new() } else { analyze_with(&q, rem) };
         self.row_len = self.compute_row_len();
         self.hl = 0;
         self.mode = Mode::Row;
@@ -424,6 +487,7 @@ impl Ime {
                     fixes: c.fixes,
                     typed_code: c.typed_code,
                     english: false,
+                    last_lm: c.last_lm,
                 });
                 self.consumed = skip_apos(self.input.as_bytes(), start + c.consumed).min(self.input.len());
             }
@@ -459,6 +523,11 @@ impl Ime {
                 self.user.learn(&self.dict, &code, &text, now);
             }
         }
+        // 记下上文给下一次输入用；后面跟了符号就算断句
+        self.ctx = match (extra, self.selected.last().and_then(|s| s.last_lm)) {
+            (None, Some(id)) => Some((id, now)),
+            _ => None,
+        };
         if let Some(c) = extra {
             text.push(c);
         }
@@ -492,6 +561,7 @@ impl Ime {
     fn commit_raw(&mut self) -> Response {
         let mut text: String = self.selected.iter().map(|s| s.text.as_str()).collect();
         text.push_str(self.remaining());
+        self.ctx = None;
         self.reset();
         Response { consumed: true, commit: Some(text) }
     }
@@ -544,6 +614,7 @@ impl Ime {
             pages,
             total,
             corrected: shown.iter().map(|c| c.corrected()).collect(),
+            english_mode: self.english_mode,
         }
     }
 }
@@ -764,6 +835,85 @@ mod tests {
         typ(&mut m, "nihao");
         key(&mut m, Key::Escape);
         assert!(!m.is_composing());
+    }
+
+    #[test]
+    fn previous_word_is_used_as_context() {
+        use crate::lm::{Lm, LmBuilder};
+        let mut b = DictBuilder::new(["zou", "ba"].map(String::from));
+        let zou = b.code("zou").unwrap();
+        let ba = b.code("ba").unwrap();
+        b.add(&zou, "走", -6.0);
+        b.add(&ba, "把", -4.0);
+        b.add(&ba, "吧", -6.0);
+        let d = Dict::from_bytes(b.build()).unwrap();
+        // 词表按字节排序：吧 把 走；"走"后面常跟"吧"
+        let lm = LmBuilder {
+            vocab: ["吧", "把", "走"].map(String::from).to_vec(),
+            uni: vec![-6.0, -4.0, -6.0],
+            backoff: vec![-1.0, -1.0, -1.0],
+            succ: vec![vec![], vec![], vec![(0, -0.3)]],
+            fallback_offset: 0.0,
+        };
+        let mut m = Ime::new(d, UserDb::in_memory());
+        m.set_lm(Lm::from_bytes(lm.build()).unwrap());
+        m.set_clock(|| 1000);
+        // 没有上文：把
+        typ(&mut m, "ba");
+        assert_eq!(m.view().items[0], "把");
+        key(&mut m, Key::Escape);
+        // 先打"走"上屏，再打 ba：吧
+        assert_eq!(typ(&mut m, "zou "), "走");
+        typ(&mut m, "ba");
+        assert_eq!(m.view().items[0], "吧");
+        key(&mut m, Key::Escape);
+        // 中间打了个逗号（原样交给程序），上文断开
+        assert_eq!(typ(&mut m, "zou "), "走");
+        assert_eq!(key(&mut m, Key::Char(',')), Response::pass());
+        typ(&mut m, "ba");
+        assert_eq!(m.view().items[0], "把");
+    }
+
+    #[test]
+    fn shift_tap_switches_to_pure_english() {
+        let mut m = ime();
+        // 切到英文：所有键原样交给程序
+        assert_eq!(key(&mut m, Key::ShiftTap), Response { consumed: true, commit: None });
+        assert!(m.view().english_mode);
+        for k in [Key::Char('n'), Key::Char('i'), Key::Space, Key::Char(','), Key::Enter, Key::Char('-')] {
+            assert_eq!(key(&mut m, k), Response::pass());
+        }
+        assert!(!m.is_composing());
+        // 再按一下回到中文
+        key(&mut m, Key::ShiftTap);
+        assert!(!m.view().english_mode);
+        assert_eq!(typ(&mut m, "nihao "), "你好");
+        // 打拼音打到一半按 Shift：字母原样上屏，然后是英文
+        typ(&mut m, "nihao");
+        assert_eq!(key(&mut m, Key::ShiftTap).commit.as_deref(), Some("nihao"));
+        assert!(m.view().english_mode);
+        assert!(!m.is_composing());
+        // Shift+字母（大写）不会切换
+        key(&mut m, Key::ShiftTap);
+        typ(&mut m, "Ni");
+        assert!(m.is_composing());
+        assert!(!m.view().english_mode);
+    }
+
+    #[test]
+    fn output_is_never_full_width() {
+        // 空格、标点、字母、数字永远是英文半角，不会出现全角空格（U+3000）或全角符号（U+FF01–FF5E）
+        let mut m = ime();
+        let full = |s: &str| s.chars().any(|c| c == '\u{3000}' || ('\u{FF01}'..='\u{FF5E}').contains(&c));
+        let mut out = String::new();
+        for s in ["nihao ", "nihao,", "shi.", "a!", "zhang zi han?", "ni hao;", "xian'"] {
+            out.push_str(&typ(&mut m, s));
+            key(&mut m, Key::Escape);
+        }
+        assert!(!full(&out), "{out:?}");
+        for c in " ,.!?;:'\"()[]{}<>@#$%^&*-_=+/\\|`~1234567890".chars() {
+            assert_eq!(key(&mut m, Key::Char(c)), Response::pass(), "{c:?}");
+        }
     }
 
     #[test]

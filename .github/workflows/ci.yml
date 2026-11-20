@@ -48,6 +48,12 @@ jobs:
         shell: bash
         run: cargo run --release -p dictgen
 
+      - name: 下载语言模型（本仓库 Releases，核对校验码）
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: tools/fetch-lm.sh
+
       - name: 测试（包括打字回归测试和长时间内存测试）
         shell: bash
         env:

@@ -15,15 +15,15 @@ xian	西安	5
 fangan	方案	1
 fangan	反感	2
 dangan	档案	1
-dangan	单干	80
+dangan	单干	200
 qie	企鹅	5
-piao	皮袄	5
+piao	皮袄	200
 tiananmen	天安门	1
 xi'an	西安	1
 
 # 简拼、混拼、边打边出
 zg	中国	8
-zgr	中国人	1
+zgr	中国人	3
 sjk	数据库	1
 zhongg	中国	1
 zhonggu	中古	1
@@ -65,8 +65,8 @@ zheba	这把	1
 nihao	拟好	-
 nihao	你	3
 # 词库里没有的搭配也要能找到
-haozhang	好长	1
-haozhang	好胀	60
+haozhang	好胀	3
+haozhang	好长	30
 # 打错纠正
 woxuhuan	我喜欢	1
 # 英文

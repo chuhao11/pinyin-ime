@@ -2,13 +2,14 @@
 
 给自己用的 Windows 拼音输入法。设计和已定规则见 [docs/方案.md](docs/方案.md)。
 
-现在完成的是第一步：引擎核心（拼音切分、词库、排序、记忆、按键规则），可以在 Mac 上试打。
+现在完成的是引擎核心（拼音切分、词库、排序、记忆、按键规则、打错纠正、英文、语言模型），可以在 Mac 上试打；Windows 外壳还没做。
 
 ## 在 Mac 上试打
 
 ```bash
 tools/fetch-data.sh                      # 下载词库源数据（固定版本，核对校验码）
 cargo run --release -p dictgen           # 编译词库到 data/build/pinyin.dict
+tools/fetch-lm.sh                        # 下载语言模型（GitHub Releases 里的 pinyin.lm）
 cargo run --release -p pinyin-cli        # 打开试打工具
 ```
 
@@ -21,6 +22,7 @@ cargo run --release -p pinyin-cli        # 打开试打工具
 | `crates/engine` | 引擎核心（Mac 和 Windows 通用） |
 | `crates/dictgen` | 词库编译工具 |
 | `crates/cli` | 终端试打工具 |
+| `crates/lmgen` | 语言模型生成工具（要先下载几 GB 语料，见 docs/方案.md） |
 | `crates/engine/tests/cases.tsv` | 打字回归测试：拼音 → 应该排在前几位的字词 |
 | `docs/` | 方案、表外字清单 |
 | `tools/fetch-data.sh` | 下载词库源数据 |

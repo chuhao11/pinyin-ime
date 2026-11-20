@@ -12,6 +12,7 @@ use std::collections::HashSet;
 
 use crate::dict::Dict;
 use crate::english::{edit_cost, match_case, max_cost, EnglishDict};
+use crate::lm::Lm;
 use crate::pinyin::{skip_apos, tokenize, Fix, TokKind, Token};
 use crate::userdb::{self, UserDb};
 
@@ -20,7 +21,9 @@ pub const MAX_WORD_SYL: usize = 12;
 /// 实在拼不成拼音的字母，原样保留时的扣分。
 const PEN_RAW: f32 = -25.0;
 /// 同样覆盖全部输入时，多音节词每多一个音节的加分（让"西安"能排进 `xian` 的前几位）。
+/// 有语言模型时词的概率已经比较准，只加一点。
 const MULTI_SYL_BONUS: f32 = 2.5;
+const MULTI_SYL_BONUS_LM: f32 = 1.0;
 /// 比同组最好的候选差这么多就算"质量太差"，候选条不硬凑。
 const POOR_GAP: f32 = 10.0;
 /// 全部对上的多字词：比最好的词差 4 以上、又比开头单字差 5 以上（比如 nihao 的"拟好"），挪到单字后面。
@@ -91,6 +94,8 @@ pub struct Candidate {
     pub fixes: Vec<Fix>,
     /// 打错时你实际打的拼音（都是完整音节时才有），用来记住"这样打错就是想要这个"
     pub typed_code: Option<Vec<u16>>,
+    /// 最后一个词在语言模型里的编号（上屏后当下一次输入的上文）
+    pub last_lm: Option<u32>,
 }
 
 impl Candidate {
@@ -110,6 +115,7 @@ impl Candidate {
             learnable: false,
             fixes: Vec::new(),
             typed_code: None,
+            last_lm: None,
         }
     }
 }
@@ -127,8 +133,14 @@ type FixAt = (usize, Fix, Option<u16>);
 struct Hit {
     end: usize,
     src: Src,
-    /// 词本身的分数（含简拼、纠错扣分）
+    /// 词本身的分数（单词概率 + 简拼、纠错扣分）
     score: f32,
+    /// 简拼、纠错扣分
+    pen: f32,
+    /// 在语言模型里的编号
+    lm: Option<u32>,
+    /// 这个读音占这个字（词）所有读音的比例（对数）。语言模型按文字统计，分不出读音，要靠它
+    rd: f32,
     /// 记忆加分
     bonus: f32,
     code: Vec<u16>,
@@ -144,6 +156,13 @@ impl Hit {
     fn dp_score(&self) -> f32 {
         self.score + self.bonus.min(DP_BONUS_CAP)
     }
+    /// 前一个词是 `prev` 时的分数（有语言模型时看搭配，否则就是单词分数）。
+    fn after(&self, lm: Option<&Lm>, prev: Option<u32>) -> f32 {
+        match (lm, prev, self.lm) {
+            (Some(lm), Some(p), Some(w)) => lm.logp(p, w) + self.rd + self.pen,
+            _ => self.score,
+        }
+    }
     fn typed_code(&self) -> Option<Vec<u16>> {
         if self.fixes.is_empty() {
             return None;
@@ -158,6 +177,7 @@ impl Hit {
 
 struct Ctx<'a> {
     dict: &'a Dict,
+    lm: Option<&'a Lm>,
     user: &'a UserDb,
     toks: &'a [Vec<Token>],
     s: &'a [u8],
@@ -206,14 +226,34 @@ impl Walk {
     }
 }
 
+/// 词的单词分数和语言模型编号。
+/// - 没有语言模型：用词库分数。
+/// - 单字：没有上文时仍按词库排（常用字、简单字优先，"是"永远在 shi 的第一位）；有上文时才看搭配。
+/// - 多字词：语言模型的概率 × 这个读音的比例；不在模型词表里的用词库分数换算。
+fn word_uni(ctx: &Ctx, text: &str, dict_score: f32, reading: f32) -> (Option<u32>, f32) {
+    let Some(lm) = ctx.lm else { return (None, dict_score) };
+    let id = lm.id(text);
+    let single = text.chars().nth(1).is_none();
+    match id {
+        _ if single => (id, dict_score),
+        Some(id) => (Some(id), lm.uni(id) + reading),
+        None => (None, lm.fallback(dict_score)),
+    }
+}
+
 /// 沿词库字典树走，每个节点最多收 `limit` 个字词。
 fn dfs_dict(ctx: &Ctx, node: u32, pos: usize, pen: f32, w: &mut Walk, limit: usize, out: &mut Vec<Hit>) {
     if w.can_emit() {
         for wi in ctx.dict.node_words(node).take(limit) {
+            let rd = ctx.dict.word_reading(wi);
+            let (lm, uni) = word_uni(ctx, ctx.dict.word_text(wi), ctx.dict.word_score(wi), rd);
             out.push(Hit {
                 end: pos,
                 src: Src::Dict(wi),
-                score: ctx.dict.word_score(wi) + pen,
+                score: uni + pen,
+                pen,
+                lm,
+                rd,
                 bonus: 0.0,
                 code: w.code.clone(),
                 fixes: w.fixes.clone(),
@@ -254,10 +294,17 @@ fn dfs_user(ctx: &Ctx, node: u32, pos: usize, pen: f32, w: &mut Walk, out: &mut 
     if w.can_emit() {
         for &i in ctx.user.node_entries(node) {
             let e = ctx.user.entry(i);
+            let (lm, uni) = match ctx.lm.and_then(|l| l.id(&e.text).map(|id| (id, l.uni(id)))) {
+                Some((id, u)) => (Some(id), u.max(USER_BASE)),
+                None => (None, USER_BASE),
+            };
             out.push(Hit {
                 end: pos,
                 src: Src::User(i),
-                score: USER_BASE + pen,
+                score: uni + pen,
+                pen,
+                lm,
+                rd: 0.0,
                 bonus: userdb::bonus(e.effective(ctx.now)),
                 code: w.code.clone(),
                 fixes: w.fixes.clone(),
@@ -314,6 +361,8 @@ struct PathEnt {
     prev: usize,
     prev_k: usize,
     step: Step,
+    /// 这条路径最后一个词（语言模型编号）
+    last: Option<u32>,
 }
 
 fn push_k(list: &mut Vec<PathEnt>, e: PathEnt) {
@@ -336,10 +385,28 @@ struct Path {
     fixes: Vec<Fix>,
     typed_code: Option<Vec<u16>>,
     syllables: usize,
+    last_lm: Option<u32>,
+}
+
+/// 生成候选要用到的东西。
+pub struct Query<'a> {
+    pub dict: &'a Dict,
+    pub en: Option<&'a EnglishDict>,
+    pub lm: Option<&'a Lm>,
+    pub user: &'a UserDb,
+    /// 上文：刚上屏的最后一个词（语言模型编号）
+    pub prev: Option<u32>,
+    pub now: i64,
+}
+
+/// 生成候选（不用语言模型、没有上文）。
+pub fn analyze(dict: &Dict, en: Option<&EnglishDict>, user: &UserDb, input: &str, now: i64) -> Vec<Candidate> {
+    analyze_with(&Query { dict, en, lm: None, user, prev: None, now }, input)
 }
 
 /// 生成候选。`input` 是还没上屏的那部分输入（原样，可以有大写和 `'`）。
-pub fn analyze(dict: &Dict, en: Option<&EnglishDict>, user: &UserDb, input: &str, now: i64) -> Vec<Candidate> {
+pub fn analyze_with(q: &Query, input: &str) -> Vec<Candidate> {
+    let (dict, en, lm, user, now) = (q.dict, q.en, q.lm, q.user, q.now);
     if input.is_empty() || !input.is_ascii() {
         return Vec::new();
     }
@@ -351,7 +418,7 @@ pub fn analyze(dict: &Dict, en: Option<&EnglishDict>, user: &UserDb, input: &str
         (1.2 * (1.0 + user.fix_count(&a, &b, now)).ln()) as f32
     };
     let toks = tokenize(dict, s, &fix_bonus);
-    let ctx = Ctx { dict, user, toks: &toks, s, now };
+    let ctx = Ctx { dict, lm, user, toks: &toks, s, now };
     let start0 = skip_apos(s, 0);
 
     // ---- 词网：每个起点出发能查到的词 ----
@@ -379,7 +446,11 @@ pub fn analyze(dict: &Dict, en: Option<&EnglishDict>, user: &UserDb, input: &str
             }
         }
         if all {
+            // 排候选时看上文（刚上屏的词）
             first_hits = hits.clone();
+            for h in first_hits.iter_mut() {
+                h.score = h.after(lm, q.prev);
+            }
         }
         // 每个终点只留最好的几条边
         hits.sort_by(|a, b| b.end.cmp(&a.end).then(b.dp_score().total_cmp(&a.dp_score())));
@@ -400,7 +471,7 @@ pub fn analyze(dict: &Dict, en: Option<&EnglishDict>, user: &UserDb, input: &str
 
     // ---- 整句：在词网上找分数最高的若干条路径 ----
     let mut paths: Vec<Vec<PathEnt>> = vec![Vec::new(); n + 1];
-    paths[start0].push(PathEnt { score: 0.0, prev: 0, prev_k: 0, step: Step::Start });
+    paths[start0].push(PathEnt { score: 0.0, prev: 0, prev_k: 0, step: Step::Start, last: q.prev });
     for p in 0..n {
         if paths[p].is_empty() {
             continue;
@@ -409,14 +480,17 @@ pub fn analyze(dict: &Dict, en: Option<&EnglishDict>, user: &UserDb, input: &str
         let entries = paths[p].clone();
         for (ki, e) in entries.iter().enumerate() {
             if q >= n {
-                push_k(&mut paths[n], PathEnt { score: e.score, prev: p, prev_k: ki, step: Step::Skip });
+                push_k(&mut paths[n], PathEnt { score: e.score, prev: p, prev_k: ki, step: Step::Skip, last: e.last });
                 continue;
             }
             for (k, h) in edges[q].iter().enumerate() {
-                let ent = PathEnt { score: e.score + h.dp_score(), prev: p, prev_k: ki, step: Step::Edge { at: q, k } };
+                // 有语言模型时，看前一个词和这个词的搭配
+                let sc = h.after(lm, e.last) + h.bonus.min(DP_BONUS_CAP);
+                let ent =
+                    PathEnt { score: e.score + sc, prev: p, prev_k: ki, step: Step::Edge { at: q, k }, last: h.lm };
                 push_k(&mut paths[h.end], ent);
             }
-            let raw = PathEnt { score: e.score + PEN_RAW, prev: p, prev_k: ki, step: Step::Raw { at: q } };
+            let raw = PathEnt { score: e.score + PEN_RAW, prev: p, prev_k: ki, step: Step::Raw { at: q }, last: None };
             push_k(&mut paths[q + 1], raw);
         }
     }
@@ -449,6 +523,7 @@ pub fn analyze(dict: &Dict, en: Option<&EnglishDict>, user: &UserDb, input: &str
             fixes: Vec::new(),
             typed_code: Some(Vec::new()),
             syllables: 0,
+            last_lm: None,
         };
         let mut any_fix = false;
         for (t, h) in pieces {
@@ -456,6 +531,7 @@ pub fn analyze(dict: &Dict, en: Option<&EnglishDict>, user: &UserDb, input: &str
             match h {
                 Some(h) => {
                     p.pieces += 1;
+                    p.last_lm = h.lm;
                     p.code.extend_from_slice(&h.code);
                     p.syllables += h.code.len();
                     p.exact &= h.exact;
@@ -470,6 +546,7 @@ pub fn analyze(dict: &Dict, en: Option<&EnglishDict>, user: &UserDb, input: &str
                 None => {
                     p.raw = true;
                     p.exact = false;
+                    p.last_lm = None;
                 }
             }
         }
@@ -518,6 +595,7 @@ pub fn analyze(dict: &Dict, en: Option<&EnglishDict>, user: &UserDb, input: &str
         learnable: p.text.chars().count() <= LEARN_SENTENCE_MAX,
         fixes: p.fixes.clone(),
         typed_code: p.typed_code.clone(),
+        last_lm: p.last_lm,
     };
     if let Some(b) = &best {
         if !b.raw && b.pieces >= 2 {
@@ -578,7 +656,8 @@ pub fn analyze(dict: &Dict, en: Option<&EnglishDict>, user: &UserDb, input: &str
     let en_best = ens.first().map(|c| c.score).unwrap_or(f32::NEG_INFINITY);
 
     let covers_all = |end: usize| skip_apos(s, end) >= n;
-    let multi = |h: &Hit| if covers_all(h.end) { MULTI_SYL_BONUS * (h.code.len() as f32 - 1.0) } else { 0.0 };
+    let msb = if lm.is_some() { MULTI_SYL_BONUS_LM } else { MULTI_SYL_BONUS };
+    let multi = |h: &Hit| if covers_all(h.end) { msb * (h.code.len() as f32 - 1.0) } else { 0.0 };
     let word_cand = |h: &Hit, poor: bool| Candidate {
         text: hit_text(&ctx, h).to_string(),
         consumed: if covers_all(h.end) { n } else { h.end },
@@ -590,6 +669,7 @@ pub fn analyze(dict: &Dict, en: Option<&EnglishDict>, user: &UserDb, input: &str
         learnable: true,
         fixes: h.fixes.iter().map(|f| f.1).collect(),
         typed_code: h.typed_code(),
+        last_lm: h.lm,
     };
     let mut full: Vec<&Hit> = first_hits.iter().filter(|h| covers_all(h.end)).collect();
     full.sort_by(|a, b| (b.rank_score() + multi(b)).total_cmp(&(a.rank_score() + multi(a))));

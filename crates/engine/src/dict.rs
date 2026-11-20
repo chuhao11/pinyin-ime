@@ -11,9 +11,9 @@ use std::ops::Range;
 use std::path::Path;
 
 pub const MAGIC: &[u8; 8] = b"PYIMEDC1";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
-const NSEC: usize = 9;
+const NSEC: usize = 10;
 const S_SYL_OFF: usize = 0; // u32 × (音节数+1)
 const S_SYL_BLOB: usize = 1; // 音节字符串
 const S_NODE_CHILD: usize = 2; // u32 × (节点数+1)：每个节点的边在边数组里的起点
@@ -23,6 +23,7 @@ const S_EDGE_NODE: usize = 5; // u32 × 边数：边指向的节点
 const S_WORD_OFF: usize = 6; // u32 × (字词数+1)：字词文字在文字区的起点
 const S_WORD_SCORE: usize = 7; // f32 × 字词数：分数（对数概率，越大越常用）
 const S_TEXT: usize = 8; // 字词文字（UTF-8）
+const S_READING: usize = 9; // f32 × 字词数：这个读音占这个字（词）所有读音的比例（对数），比如"呢"读 ni 很少见
 const HEADER_LEN: usize = 16 + NSEC * 16;
 
 #[derive(Debug)]
@@ -134,7 +135,7 @@ impl Dict {
             return err("边表长度不一致");
         }
         let n_words = count(S_WORD_OFF, 4)?.checked_sub(1).ok_or(DictError("字词表为空".into()))?;
-        if count(S_WORD_SCORE, 4)? != n_words {
+        if count(S_WORD_SCORE, 4)? != n_words || count(S_READING, 4)? != n_words {
             return err("分数表长度不一致");
         }
         if n_syl > u16::MAX as usize {
@@ -214,7 +215,9 @@ impl Dict {
             prev = v;
         }
         for i in 0..self.n_words {
-            if !f32::from_bits(rd_u32(b, sec[S_WORD_SCORE].0 + i * 4)).is_finite() {
+            if !f32::from_bits(rd_u32(b, sec[S_WORD_SCORE].0 + i * 4)).is_finite()
+                || !f32::from_bits(rd_u32(b, sec[S_READING].0 + i * 4)).is_finite()
+            {
                 return err("分数不是有限数");
             }
         }
@@ -307,8 +310,35 @@ impl Dict {
         std::str::from_utf8(&self.b()[base + s..base + e]).unwrap_or("")
     }
 
+    /// 这个读音占这个字（词）所有读音的比例（对数，≤ 0）。
+    pub fn word_reading(&self, w: u32) -> f32 {
+        f32::from_bits(self.u32_at(S_READING, w as usize))
+    }
+
     pub fn word_score(&self, w: u32) -> f32 {
         f32::from_bits(self.u32_at(S_WORD_SCORE, w as usize))
+    }
+
+    /// 节点下的所有边：(音节, 子节点)。
+    pub fn children(&self, node: u32) -> impl Iterator<Item = (u16, u32)> + '_ {
+        self.child_edges(node).map(move |e| (self.edge_syl(e), self.edge_node(e)))
+    }
+
+    /// 遍历所有字词：回调 (拼音编号, 字词编号)。
+    pub fn for_each_word(&self, mut f: impl FnMut(&[u16], u32)) {
+        let mut stack: Vec<(u32, Vec<u16>)> = vec![(self.root(), Vec::new())];
+        while let Some((node, code)) = stack.pop() {
+            if !code.is_empty() {
+                for w in self.node_words(node) {
+                    f(&code, w);
+                }
+            }
+            for (syl, child) in self.children(node) {
+                let mut c = code.clone();
+                c.push(syl);
+                stack.push((child, c));
+            }
+        }
     }
 
     /// 按完整拼音查字词（调试和测试用），例如 `lookup("xi an")`。
@@ -343,7 +373,7 @@ fn partition(r: Range<usize>, pred: impl Fn(usize) -> bool) -> usize {
 #[derive(Default)]
 struct BNode {
     children: Vec<(u16, u32)>,
-    words: Vec<(f32, String)>,
+    words: Vec<(f32, String, f32)>,
 }
 
 /// 生成词库文件。
@@ -374,6 +404,12 @@ impl DictBuilder {
     }
 
     pub fn add(&mut self, code: &[u16], text: &str, score: f32) {
+        self.add_with_reading(code, text, score, 0.0);
+    }
+
+    /// 加一个字词，同时给出这个读音占所有读音的比例（对数）。
+    pub fn add_with_reading(&mut self, code: &[u16], text: &str, score: f32, reading: f32) {
+        assert!(reading.is_finite());
         assert!(!code.is_empty() && score.is_finite());
         let mut n = 0usize;
         for &s in code {
@@ -387,7 +423,7 @@ impl DictBuilder {
                 }
             };
         }
-        self.nodes[n].words.push((score, text.to_string()));
+        self.nodes[n].words.push((score, text.to_string(), reading));
     }
 
     pub fn build(mut self) -> Vec<u8> {
@@ -404,6 +440,7 @@ impl DictBuilder {
         let mut edge_node: Vec<u32> = Vec::new();
         let mut word_off = vec![0u32];
         let mut word_score: Vec<f32> = Vec::new();
+        let mut word_reading: Vec<f32> = Vec::new();
         let mut text: Vec<u8> = Vec::new();
         for node in self.nodes.iter_mut() {
             node_child.push(edge_syl.len() as u32);
@@ -414,11 +451,12 @@ impl DictBuilder {
             }
             node.words.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
             let mut seen = HashSet::new();
-            for (sc, t) in node.words.drain(..) {
+            for (sc, t, rd) in node.words.drain(..) {
                 if seen.insert(t.clone()) {
                     text.extend_from_slice(t.as_bytes());
                     word_off.push(text.len() as u32);
                     word_score.push(sc);
+                    word_reading.push(rd);
                 }
             }
             node.children = Vec::new();
@@ -437,6 +475,7 @@ impl DictBuilder {
             u32s(&word_off),
             word_score.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect(),
             text,
+            word_reading.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect(),
         ];
         let mut out = vec![0u8; HEADER_LEN];
         out[0..8].copy_from_slice(MAGIC);
