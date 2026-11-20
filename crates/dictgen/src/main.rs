@@ -17,8 +17,8 @@ use std::process::ExitCode;
 use pinyin_engine::DictBuilder;
 
 /// 表外字在词库里的总权重达到这么多，或者出现在这么多个词里，就保留。
-const KEEP_WEIGHT: u64 = 1000;
-const KEEP_WORDS: usize = 5;
+const KEEP_WEIGHT: u64 = 200;
+const KEEP_WORDS: usize = 3;
 /// 单字按等级扣分：[未用, 一级, 二级, 三级, 表外]
 const CHAR_PEN: [f64; 5] = [0.0, 0.0, -1.0, -2.5, -4.0];
 /// 词里每个字按等级扣分
@@ -75,6 +75,27 @@ struct CharInfo {
     /// 1/2/3 = 通用规范汉字表一二三级，4 = 表外
     tier: u8,
     strokes: u32,
+}
+
+/// 繁体字：Unihan 里有简体对应字、而且简体不是它自己的字。
+fn load_traditional(dir: &Path) -> Result<HashSet<char>, String> {
+    let p = dir.join("Unihan_Variants.txt");
+    let mut simp: HashMap<char, Vec<char>> = HashMap::new();
+    for line in fs::read_to_string(&p).map_err(|e| format!("读不了 {}：{e}", p.display()))?.lines() {
+        let mut f = line.split('\t');
+        let (Some(cp), Some("kSimplifiedVariant"), Some(v)) = (f.next(), f.next(), f.next()) else { continue };
+        let Some(c) = cp.strip_prefix("U+").and_then(|x| u32::from_str_radix(x, 16).ok()).and_then(char::from_u32)
+        else {
+            continue;
+        };
+        for t in v.split_whitespace() {
+            if let Some(t) = t.strip_prefix("U+").and_then(|x| u32::from_str_radix(x, 16).ok()).and_then(char::from_u32)
+            {
+                simp.entry(c).or_default().push(t);
+            }
+        }
+    }
+    Ok(simp.into_iter().filter(|(c, v)| !v.contains(c)).map(|(c, _)| c).collect())
 }
 
 fn load_unihan(dir: &Path) -> Result<HashMap<char, CharInfo>, String> {
@@ -135,6 +156,10 @@ fn run() -> Result<(), String> {
     let info = load_unihan(&args.raw.join("unihan"))?;
     let tier = |c: char| info.get(&c).map(|i| i.tier).unwrap_or(4);
     let is_han = |c: char| info.contains_key(&c) || c == '〇';
+    let trad = load_traditional(&args.raw.join("unihan"))?;
+    // 表外的繁体字不要（表内的都是规范简体字）
+    let is_trad = |c: char| tier(c) == 4 && trad.contains(&c);
+    let mut trad_singles: Vec<char> = Vec::new();
 
     // ---- 单字 ----
     let mut chars: Vec<(char, String, u64)> = Vec::new();
@@ -142,6 +167,12 @@ fn run() -> Result<(), String> {
         if r.len() >= 3 {
             let mut it = r[0].chars();
             if let (Some(c), None) = (it.next(), it.next()) {
+                if is_trad(c) {
+                    if !trad_singles.contains(&c) {
+                        trad_singles.push(c);
+                    }
+                    continue;
+                }
                 chars.push((c, r[1].clone(), r[2].parse().unwrap_or(0)));
             }
         }
@@ -233,8 +264,11 @@ fn run() -> Result<(), String> {
             }
         }
     }
-    let kept_extra: HashSet<char> =
-        usage.iter().filter(|(_, u)| u.1 >= KEEP_WEIGHT || u.0 >= KEEP_WORDS).map(|(c, _)| *c).collect();
+    let kept_extra: HashSet<char> = usage
+        .iter()
+        .filter(|(c, u)| !is_trad(**c) && (u.1 >= KEEP_WEIGHT || u.0 >= KEEP_WORDS))
+        .map(|(c, _)| *c)
+        .collect();
     let char_ok = |c: char| {
         if is_han(c) {
             in_table(c) || kept_extra.contains(&c)
@@ -344,7 +378,10 @@ fn run() -> Result<(), String> {
             "- 其余表外字：在词库里总权重 ≥ {KEEP_WEIGHT} 或出现在 ≥ {KEEP_WORDS} 个词里的保留，只在词里出现，不单独当候选（第二部分）；"
         );
         let _ = writeln!(md, "  其余的连同所在的词一起删掉（第三部分列出用量最高的，拿不准的可以挑出来加回去）。");
+        let _ = writeln!(md, "- 表外的繁体字一律不要，连同所在的词一起删掉（第三部分里也会列出）。");
         let _ = writeln!(md, "- 只在大字表里、从来不出现在任何词里的字（比如\"鯙\"）根本不收，这里也不列。\n");
+        trad_singles.sort();
+        let _ = writeln!(md, "雾凇字表里因为是繁体而去掉的单字：{}\n", trad_singles.iter().collect::<String>());
         let _ = writeln!(md, "## 一、雾凇字表额外收录（{} 个，保留）\n", extra_in_table.len());
         let _ = writeln!(md, "{}\n", extra_in_table.iter().collect::<String>());
         let _ = writeln!(md, "## 二、因为在词里有用量而保留（{} 个，只在词里出现）\n", kept.len());
