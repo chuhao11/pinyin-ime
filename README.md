@@ -40,7 +40,7 @@ git commit -m “修复”    # 中文引号，命令出错
 
 ## 安装（Windows 10 / 11，64 位）
 
-1. 到 [Releases](../../releases/latest) 下载最新的 `PinyinIME-Setup-*.exe`（约 105 MB，不用登录）。
+1. 到 [Releases](../../releases) 下载最新的 `PinyinIME-Setup-*.exe`（约 105 MB，不用登录）。
 2. 双击安装。安装程序没有数字签名，Windows 可能提示“已保护你的电脑”，点“更多信息 → 仍要运行”。
 3. 按 **Win+空格** 切到“拼音”就能用了。桌面上的“拼音输入法设置”可以改文风和中文标点。
 
