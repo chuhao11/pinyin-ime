@@ -27,6 +27,9 @@ pub const MAX_SYL_LEN: usize = 6;
 pub const PEN_INITIAL: f32 = -1.5;
 /// 末尾没打完的音节扣分。
 pub const PEN_PARTIAL: f32 = -0.5;
+/// 简拼把一个完整音节拆开了，再多扣这么多：`gun` 本身是完整音节，切成 gu + n（姑娘）、
+/// `lin` 切成 li + n（理念）、`xiang` 切成 xian + g，都不是你想打的，除非你经常打那个词。
+pub const PEN_SPLIT_SYLLABLE: f32 = -3.0;
 /// 打错纠正的扣分：按到旁边的键、两个字母打反、多打一个、漏打一个。
 pub const PEN_NEIGHBOR: f32 = -5.0;
 pub const PEN_SWAP: f32 = -4.5;
@@ -269,6 +272,19 @@ pub fn tokenize(dict: &Dict, s: &[u8], fix_bonus: &dyn Fn(&Fix) -> f32) -> Vec<V
                         second: Some(id2),
                     });
                 }
+            }
+        }
+    }
+    // 简拼（或没打完的音节）和前面的字母拼起来本身就是一个完整音节：说明这里本来是一个音节，被拆开了
+    for (k, toks) in out.iter_mut().enumerate().take(n).skip(1) {
+        for t in toks.iter_mut() {
+            if !matches!(t.kind, TokKind::Initial | TokKind::Partial) {
+                continue;
+            }
+            let splits =
+                (k.saturating_sub(MAX_SYL_LEN)..k).any(|i| full_ends[i].contains(&k) && full_ends[i].contains(&t.end));
+            if splits {
+                t.pen += PEN_SPLIT_SYLLABLE;
             }
         }
     }

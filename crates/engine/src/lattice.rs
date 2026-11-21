@@ -63,6 +63,26 @@ const MAX_EN: usize = 8;
 const RECENT_SLOT: usize = 3;
 /// 多久以内选过的才算"上次选过"。
 const RECENT_SECS: i64 = 60 * 86400;
+/// 打的正好是一个完整音节时，前几个位置留给这个音的单字（`gun` → 滚 棍 衮，然后才是"姑娘"这种词）。
+const SINGLE_HEAD: usize = 3;
+/// 你经常打的词（有效次数达到这么多）不受上面的限制，可以排在单字前面。
+const OFTEN_USED: f64 = 2.0;
+/// 单字"几十次就改"：一个字你选了这么多次，而且比现在排第一的字多选一半以上，它就排第一。
+const CHAR_TAKEOVER: f64 = 20.0;
+const CHAR_TAKEOVER_RATIO: f64 = 1.5;
+/// 上文（刚上屏的词）对下一个字词分数的影响上限：上文只能微调，不能让一个不相干的字突然排第一。
+/// 单字更严：单字的顺序要你自己选几十次才会变。
+const CTX_UP_CHAR: f32 = 1.0;
+const CTX_UP_WORD: f32 = 2.5;
+const CTX_DOWN: f32 = 3.0;
+/// 真正常见的搭配（前一个词后面接它的概率至少 5%，比如 走→吧、数字→年）上限放宽到这么多
+const CTX_UP_STRONG: f32 = 3.0;
+const STRONG_PAIR: f32 = -3.0;
+/// 上一个字词和这个字词连起来本身就是一个词（谢+谢、吃+饭、走+吧、滚+滚）：最可靠的前后关联，加这么多。
+/// （语言模型按词统计，"谢谢"是一个词，所以"谢"后面接"谢"在统计里反而少见，不能只看统计。）
+const CTX_JOINED: f32 = 2.0;
+/// 连起来的词至少要这么常见才算（太生僻的组合不算）
+const JOINED_MIN_UNI: f32 = -15.0;
 /// 一个词里最多纠正几处。
 const MAX_FIXES_PER_WORD: usize = 1;
 
@@ -160,12 +180,29 @@ impl Hit {
     fn dp_score(&self) -> f32 {
         self.score + self.bonus.min(DP_BONUS_CAP)
     }
-    /// 前一个词是 `prev` 时的分数（有语言模型时看搭配，否则就是单词分数）。
+    /// 整句里：前一个词是 `prev` 时的分数（完整的语言模型）。
     fn after(&self, lm: Option<&Lm>, prev: Option<u32>) -> f32 {
         match (lm, prev, self.lm) {
             (Some(lm), Some(p), Some(w)) => lm.logp(p, w) + self.rd + self.pen,
             _ => self.score,
         }
+    }
+
+    /// 排候选时：刚上屏的词是 `prev`，在单独的分数上按前后关联加减一点（有上限）。
+    /// - 连起来本身是一个词（谢谢、吃饭）：加 CTX_JOINED
+    /// - 统计里真的一起出现过：按搭配好坏加减，有上限
+    /// - 统计里没见过：不扣分（没见过多半是因为它们平时连成一个词，不是搭配差）
+    fn after_ctx(&self, lm: Option<&Lm>, prev: Option<u32>, text: &str) -> f32 {
+        let (Some(lm), Some(p)) = (lm, prev) else { return self.score };
+        let up = if self.code.len() == 1 { CTX_UP_CHAR } else { CTX_UP_WORD };
+        let pair = match self.lm.and_then(|w| lm.bigram(p, w).map(|b| (b, lm.uni(w)))) {
+            Some((b, u)) => (b - u).clamp(-CTX_DOWN, if b >= STRONG_PAIR { CTX_UP_STRONG } else { up }),
+            None => 0.0,
+        };
+        let prev_text = lm.word(p);
+        let joined = !prev_text.starts_with('<')
+            && lm.id(&format!("{prev_text}{text}")).is_some_and(|j| lm.uni(j) >= JOINED_MIN_UNI);
+        self.score + if joined { pair.max(CTX_JOINED) } else { pair }
     }
     fn typed_code(&self) -> Option<Vec<u16>> {
         if self.fixes.is_empty() {
@@ -464,8 +501,14 @@ pub fn analyze_with(q: &Query, input: &str) -> Vec<Candidate> {
         if all {
             // 排候选时看上文（刚上屏的词）
             first_hits = hits.clone();
+            let prev_text = lm.zip(q.prev).map(|(l, p)| l.word(p)).filter(|t| !t.starts_with('<'));
             for h in first_hits.iter_mut() {
-                h.score = h.after(lm, q.prev);
+                let t = hit_text(&ctx, h);
+                h.score = h.after_ctx(lm, q.prev, t);
+                // 你在同样的上文后面选过它：记忆加分（比上文本身的影响大）
+                if let Some(pt) = prev_text {
+                    h.bonus += user.pair_bonus(pt, t, now);
+                }
             }
         }
         // 每个终点只留最好的几条边
@@ -787,6 +830,61 @@ pub fn analyze_with(q: &Query, input: &str) -> Vec<Candidate> {
     // 去重（保留排在前面的）
     let mut seen = HashSet::new();
     out.retain(|c| seen.insert(c.text.clone()));
+    // 打的正好是一个完整音节（gun、lin、xian）：前 3 个留给这个音的常用单字，
+    // 词（姑娘、理念、西安）排在后面——除非你经常打那个词
+    let one_syllable = !has_upper && toks[start0].iter().any(|t| t.kind == TokKind::Full && t.end == n);
+    if one_syllable {
+        let is_single = |c: &Candidate| {
+            c.kind == CandKind::Word
+                && c.code.len() == 1
+                && c.text.chars().nth(1).is_none()
+                && c.fixes.is_empty()
+                && c.consumed == n
+                && !c.poor
+        };
+        let often = |c: &Candidate| {
+            matches!(c.kind, CandKind::Word | CandKind::Sentence)
+                && user.lookup(&c.code, &c.text).is_some_and(|e| e.effective(now) >= OFTEN_USED)
+        };
+        // 前几个单字所在的范围
+        if let Some(last) =
+            out.iter().enumerate().filter(|(_, c)| is_single(c)).take(SINGLE_HEAD).map(|(i, _)| i).last()
+        {
+            let head: Vec<Candidate> = out.drain(..=last).collect();
+            let (keep, later): (Vec<Candidate>, Vec<Candidate>) =
+                head.into_iter().partition(|c| is_single(c) || often(c) || c.kind == CandKind::Raw);
+            let rest = std::mem::take(&mut out);
+            out = keep.into_iter().chain(later).chain(rest).collect();
+        }
+    }
+    // 单字"几十次就改"：你一直选的那个字排到单字的第一位
+    {
+        let single_at = |c: &Candidate| {
+            c.kind == CandKind::Word
+                && c.code.len() == 1
+                && c.text.chars().nth(1).is_none()
+                && c.fixes.is_empty()
+                && c.consumed == n
+        };
+        if let Some(first) = out.iter().position(single_at) {
+            let count = |c: &Candidate| user.char_count(c.code[0], &c.text, now);
+            let top = count(&out[first]);
+            let best = out
+                .iter()
+                .enumerate()
+                .skip(first + 1)
+                .filter(|(_, c)| single_at(c))
+                .map(|(i, c)| (i, count(c)))
+                .max_by(|a, b| a.1.total_cmp(&b.1));
+            if let Some((i, cnt)) = best {
+                if cnt >= CHAR_TAKEOVER && cnt >= top * CHAR_TAKEOVER_RATIO {
+                    let mut c = out.remove(i);
+                    c.poor = false;
+                    out.insert(first, c);
+                }
+            }
+        }
+    }
     // 上次选过、但排得靠后的字词：放进前 4 个。第一个仍然是常用的，要选很多次才会换
     let recent = out
         .iter()

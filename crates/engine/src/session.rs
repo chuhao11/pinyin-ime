@@ -543,6 +543,19 @@ impl Engine {
     fn finish(&mut self, s: &mut Session, extra: Option<String>) -> Response {
         let now = self.now();
         let mut text: String = s.selected.iter().map(|x| x.text.as_str()).collect();
+        // 前后词关联：记住"上一个词后面选了什么"（上一次上屏的词，以及这次分几段选的前后两段）
+        if let Some(lm) = &self.lm {
+            let mut prev = s.ctx.filter(|&(_, t)| now - t <= CONTEXT_SECS).map(|(id, _)| id);
+            for x in &s.selected {
+                if let Some(p) = prev {
+                    let pt = lm.word(p);
+                    if !pt.starts_with('<') && !x.english && !x.code.is_empty() {
+                        self.user.learn_pair(pt, &x.text, now);
+                    }
+                }
+                prev = x.last_lm;
+            }
+        }
         for x in &s.selected {
             if x.learnable && !x.code.is_empty() {
                 self.user.learn(&self.dict, &x.code, &x.text, now);

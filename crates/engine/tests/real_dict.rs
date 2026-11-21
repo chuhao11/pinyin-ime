@@ -327,11 +327,13 @@ fn ignored_first_choice_is_deleted() {
     assert_eq!(ime.view().items[0], "反感");
     assert!(rank_of(&ime, "方案").is_none(), "方案 应该被删掉了");
     esc(&mut ime);
-    // 单字不会被删：一直选"事"，"是"还在第一
+    // 单字不会被删：一直选"事"，"是"还在第一（每次之间断开上文，只看单字本身的记忆）
     for _ in 0..4 {
+        fresh(&mut ime);
         typ(&mut ime, "shi");
         pick(&mut ime, "事");
     }
+    fresh(&mut ime);
     typ(&mut ime, "shi");
     assert_eq!(ime.view().items[0], "是");
 }
@@ -374,4 +376,141 @@ fn name_is_remembered_after_one_use() {
     assert_eq!(pick(&mut ime, "轩").as_deref(), Some("李卓轩"));
     typ(&mut ime, "lizhuoxuan");
     assert_eq!(ime.view().items[0], "李卓轩");
+}
+
+/// 所有音节（不含 lve 这种别的写法以外的特殊情况），给下面的整类测试用。
+fn all_syllables() -> Vec<String> {
+    common::real_dict().map(|d| d.syllables().to_vec()).unwrap_or_default()
+}
+
+fn is_single_char(ime: &Ime, i: usize) -> bool {
+    let c = &ime.candidates()[i];
+    c.code.len() == 1 && c.text.chars().count() == 1 && c.fixes.is_empty()
+}
+
+/// 清空输入和上文（按一下回车：没在打字时回车原样交给程序，上文就断了）。
+fn fresh(ime: &mut Ime) {
+    esc(ime);
+    ime.process_key(Key::Enter, Mods::default());
+}
+
+#[test]
+fn full_syllable_shows_single_chars_first() {
+    // 打的正好是一个完整音节（gun、lin、ban、xian）：前 3 个都是这个音的单字，
+    // 不能是把音节拆开的简拼词（gu+n=姑娘、li+n=理念）或别的词，除非你经常打那个词
+    let Some(mut ime) = common::real_ime(UserDb::in_memory()) else { return };
+    let mut bad = Vec::new();
+    let mut checked = 0;
+    for syl in all_syllables() {
+        fresh(&mut ime);
+        typ(&mut ime, &syl);
+        let v = ime.view();
+        // 整个音节都对上的常用单字（生僻字标成"差"，不算；只对上前半截的也不算）
+        let full = |i: usize| ime.candidates()[i].consumed == syl.len();
+        let singles = (0..ime.candidates().len())
+            .filter(|&i| is_single_char(&ime, i) && full(i) && !ime.candidates()[i].poor)
+            .count();
+        let want = singles.min(3).min(v.items.len());
+        if want == 0 {
+            continue;
+        }
+        checked += 1;
+        if !(0..want).all(|i| is_single_char(&ime, i) && full(i)) {
+            bad.push(format!("{syl}: {}", v.items.join(" ")));
+        }
+    }
+    esc(&mut ime);
+    assert!(checked > 350, "只查了 {checked} 个音节");
+    assert!(bad.is_empty(), "{} 个音节前面不是单字：\n{}", bad.len(), bad.join("\n"));
+}
+
+#[test]
+fn often_used_word_can_still_come_first() {
+    // 你经常打的词例外：比如一直用 gun 打"姑娘"，它可以排到单字前面
+    let Some(mut ime) = common::real_ime(UserDb::in_memory()) else { return };
+    for _ in 0..3 {
+        typ(&mut ime, "gun");
+        pick(&mut ime, "姑娘");
+    }
+    typ(&mut ime, "gun");
+    assert!(rank_of(&ime, "姑娘").unwrap() <= 2, "{:?}", ime.view().items);
+}
+
+#[test]
+fn your_choice_after_a_word_beats_the_context() {
+    // 上文让别的字排了第一（比如刚打了"滚"，再打 gun 排出"棍"），你选了原来那个：
+    // 下次同样的上文，第一个就是你选的那个。对每个音节都检查
+    let Some(mut ime) = common::real_ime(UserDb::in_memory()) else { return };
+    let mut bad = Vec::new();
+    for syl in all_syllables() {
+        fresh(&mut ime);
+        typ(&mut ime, &syl);
+        if ime.candidates().is_empty() || !is_single_char(&ime, 0) {
+            continue;
+        }
+        let first = ime.candidates()[0].text.clone();
+        pick(&mut ime, &first);
+        for _ in 0..2 {
+            typ(&mut ime, &syl);
+            if ime.view().items.first() != Some(&first) {
+                if !ime.candidates().iter().any(|c| c.text == first) {
+                    break;
+                }
+                pick(&mut ime, &first);
+            } else {
+                esc(&mut ime);
+                break;
+            }
+        }
+        fresh(&mut ime);
+        typ(&mut ime, &syl);
+        pick(&mut ime, &first);
+        typ(&mut ime, &syl);
+        let now = ime.view().items.first().cloned().unwrap_or_default();
+        if now != first {
+            bad.push(format!("{syl}: 一直选 {first}，排第一的却是 {now}"));
+        }
+    }
+    esc(&mut ime);
+    assert!(bad.is_empty(), "{} 个音节：\n{}", bad.len(), bad.join("\n"));
+}
+
+#[test]
+fn char_picked_dozens_of_times_comes_first() {
+    // 一直选第二个字，几十次以后它排第一（连续选，上文就是它自己）
+    let Some(mut ime) = common::real_ime(UserDb::in_memory()) else { return };
+    let mut bad = Vec::new();
+    let mut checked = 0;
+    for syl in all_syllables() {
+        fresh(&mut ime);
+        typ(&mut ime, &syl);
+        let full = |i: usize| ime.candidates()[i].consumed == syl.len();
+        if ime.candidates().len() < 2 || !is_single_char(&ime, 0) || !is_single_char(&ime, 1) || !full(1) {
+            continue;
+        }
+        let want = ime.candidates()[1].text.clone();
+        fresh(&mut ime);
+        checked += 1;
+        let mut became = None;
+        for n in 1..=50 {
+            typ(&mut ime, &syl);
+            if ime.view().items.first() == Some(&want) {
+                became = Some(n);
+                esc(&mut ime);
+                break;
+            }
+            if !ime.candidates().iter().any(|c| c.text == want) {
+                bad.push(format!("{syl}: 第 {n} 次找不到 {want}：{}", ime.view().items.join(" ")));
+                break;
+            }
+            pick(&mut ime, &want);
+        }
+        if became.is_none() && !bad.last().is_some_and(|b| b.starts_with(&format!("{syl}:"))) {
+            typ(&mut ime, &syl);
+            bad.push(format!("{syl}: 选了 50 次 {want}，还是 {}", ime.view().items.join(" ")));
+        }
+    }
+    esc(&mut ime);
+    assert!(checked > 300, "只查了 {checked} 个音节");
+    assert!(bad.is_empty(), "{} 个音节选几十次也换不过来：\n{}", bad.len(), bad.join("\n"));
 }

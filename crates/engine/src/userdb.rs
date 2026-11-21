@@ -24,6 +24,14 @@ pub const MAX_SMALL_ENTRIES: usize = 5_000;
 pub const REJECT_LIMIT: u32 = 3;
 /// 单字最多记这么多条。
 pub const MAX_CHAR_ENTRIES: usize = 20_000;
+/// 搭配（上一个词 → 你选的字词）最多记这么多条。
+pub const MAX_PAIR_ENTRIES: usize = 20_000;
+
+/// 搭配的记忆加分：在同样的上文后面选过一次就够（约 +2.3），比上文本身的影响大，
+/// 所以"上文让别的字排第一、你却选了这个"之后，下次同样的上文就是这个。
+pub fn pair_bonus(eff: f64) -> f32 {
+    (1.5 * eff.min(1.0) + 1.2 * (1.0 + eff).ln()) as f32
+}
 
 /// 单字的记忆加分：很慢地增长，选 5 次约 +0.6，选 40 次约 +2.2，选 300 次约 +4.4。
 pub fn char_bonus(eff: f64) -> f32 {
@@ -85,6 +93,8 @@ pub struct UserDb {
     rejects: HashMap<(Vec<u16>, String), u32>,
     /// 单字：(音节, 字) → (有效次数, 最后时间)
     chars: HashMap<(u16, String), (f64, i64)>,
+    /// 搭配：(上一个词, 这个字词) → (有效次数, 最后时间)
+    pairs: HashMap<(String, String), (f64, i64)>,
 }
 
 fn code_to_string(dict: &Dict, code: &[u16]) -> String {
@@ -111,6 +121,7 @@ impl UserDb {
             en: HashMap::new(),
             rejects: HashMap::new(),
             chars: HashMap::new(),
+            pairs: HashMap::new(),
         }
     }
 
@@ -142,7 +153,11 @@ impl UserDb {
              CREATE TABLE IF NOT EXISTS single_chars(
                  code TEXT NOT NULL, word TEXT NOT NULL,
                  freq REAL NOT NULL, last INTEGER NOT NULL,
-                 PRIMARY KEY(code, word)) WITHOUT ROWID;",
+                 PRIMARY KEY(code, word)) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS user_pairs(
+                 prev TEXT NOT NULL, word TEXT NOT NULL,
+                 freq REAL NOT NULL, last INTEGER NOT NULL,
+                 PRIMARY KEY(prev, word)) WITHOUT ROWID;",
         )
         .map_err(|e| format!("初始化用户词库失败：{e}"))?;
 
@@ -212,6 +227,17 @@ impl UserDb {
             for (code, text, f, l) in rows.flatten() {
                 if let (Some(id), true) = (dict.syllable_id(&code), f.is_finite() && f > 0.0) {
                     db.chars.insert((id, text), (f, l));
+                }
+            }
+            let mut st = conn.prepare("SELECT prev, word, freq, last FROM user_pairs").map_err(|e| e.to_string())?;
+            let rows = st
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?, r.get::<_, i64>(3)?))
+                })
+                .map_err(|e| e.to_string())?;
+            for (a, b, f, l) in rows.flatten() {
+                if f.is_finite() && f > 0.0 {
+                    db.pairs.insert((a, b), (f, l));
                 }
             }
         }
@@ -433,6 +459,57 @@ impl UserDb {
         }
     }
 
+    /// 单字用过的有效次数。
+    pub fn char_count(&self, syl: u16, text: &str, now: i64) -> f64 {
+        self.chars.get(&(syl, text.to_string())).map(|&(f, l)| effective(f, l, now)).unwrap_or(0.0)
+    }
+
+    // ---- 搭配（前后词关联） ----
+
+    /// 上一个词是 `prev` 时，你选过 `text` 的记忆加分。
+    pub fn pair_bonus(&self, prev: &str, text: &str, now: i64) -> f32 {
+        self.pairs
+            .get(&(prev.to_string(), text.to_string()))
+            .map(|&(f, l)| pair_bonus(effective(f, l, now)))
+            .unwrap_or(0.0)
+    }
+
+    /// 记一次"上一个词是 `prev` 时选了 `text`"。
+    pub fn learn_pair(&mut self, prev: &str, text: &str, now: i64) {
+        if prev.is_empty() || text.is_empty() || prev.chars().count() > 8 || text.chars().count() > 8 {
+            return;
+        }
+        let e = self.pairs.entry((prev.to_string(), text.to_string())).or_insert((0.0, now));
+        *e = (effective(e.0, e.1, now) + 1.0, now);
+        let (f, l) = *e;
+        if let Some(conn) = &self.conn {
+            let r = conn.execute(
+                "INSERT INTO user_pairs(prev, word, freq, last) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(prev, word) DO UPDATE SET freq = excluded.freq, last = excluded.last",
+                params![prev, text, f, l],
+            );
+            if r.is_err() {
+                self.write_errors += 1;
+            }
+        }
+        if self.pairs.len() > MAX_PAIR_ENTRIES {
+            // 满了：淘汰最不常用、最久没用的一成
+            let mut v: Vec<((String, String), f64)> =
+                self.pairs.iter().map(|(k, &(f, l))| (k.clone(), effective(f, l, now))).collect();
+            v.sort_by(|a, b| a.1.total_cmp(&b.1));
+            for (k, _) in v.into_iter().take(MAX_PAIR_ENTRIES / 10) {
+                self.pairs.remove(&k);
+                if let Some(conn) = &self.conn {
+                    let _ = conn.execute("DELETE FROM user_pairs WHERE prev = ?1 AND word = ?2", params![k.0, k.1]);
+                }
+            }
+        }
+    }
+
+    pub fn pair_len(&self) -> usize {
+        self.pairs.len()
+    }
+
     // ---- 打错纠正 ----
 
     /// 你接受过这种纠正的有效次数。
@@ -620,6 +697,29 @@ mod tests {
         assert_eq!(u.len(), 1);
         assert!(u.lookup(&code, "子涵").unwrap().freq > 1.9);
         assert!(u.is_blocked(&code, "紫涵"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pairs_persist_and_stay_bounded() {
+        let d = dict();
+        let dir = std::env::temp_dir().join(format!("pyime-test-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("user.db");
+        {
+            let mut u = UserDb::open(&path, &d).unwrap();
+            assert_eq!(u.pair_bonus("滚", "滚", 10), 0.0);
+            u.learn_pair("滚", "滚", 10);
+            // 选一次就比上文本身的影响大
+            assert!(u.pair_bonus("滚", "滚", 10) > 2.0);
+        }
+        let mut u = UserDb::open(&path, &d).unwrap();
+        assert!(u.pair_bonus("滚", "滚", 10) > 2.0, "重新打开后还记得");
+        // 再多也不超过上限
+        for i in 0..(MAX_PAIR_ENTRIES + 50) {
+            u.learn_pair(&format!("词{i}"), "字", 20);
+        }
+        assert!(u.pair_len() <= MAX_PAIR_ENTRIES);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
