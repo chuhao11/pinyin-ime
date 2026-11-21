@@ -45,6 +45,8 @@ pub struct EditSession {
     svc: ComObject<TextService>,
     pub action: Action,
     pub result: Cell<bool>,
+    /// 程序已经执行了这次会话（同步请求时，请求返回前就知道）
+    pub ran: Cell<bool>,
 }
 
 fn utf16(s: &str) -> Vec<u16> {
@@ -80,7 +82,7 @@ fn fallback_rect() -> RECT {
 
 impl EditSession {
     pub fn new(ctx: ITfContext, svc: ComObject<TextService>, action: Action) -> Self {
-        EditSession { ctx, svc, action, result: Cell::new(false) }
+        EditSession { ctx, svc, action, result: Cell::new(false), ran: Cell::new(false) }
     }
 
     fn start_composition(&self, ec: u32) -> Result<ITfComposition> {
@@ -176,7 +178,14 @@ impl EditSession {
             if view.composing {
                 let comp = match self.svc.composition() {
                     Some(c) => c,
-                    None => self.start_composition(ec)?,
+                    None => match self.start_composition(ec) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            // 这里开始不了输入（不是文字框）：引擎里的拼音马上清掉，免得空格、方向键被白白拿走
+                            self.svc.compose_failed(&self.ctx);
+                            return Err(e);
+                        }
+                    },
                 };
                 let range = comp.GetRange()?;
                 range.SetText(ec, 0, &utf16(&view.preedit))?;
@@ -266,6 +275,7 @@ impl EditSession {
 
 impl ITfEditSession_Impl for EditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
+        self.ran.set(true);
         guard(|| self.run(ec), Ok(()))
     }
 }

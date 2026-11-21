@@ -59,9 +59,9 @@ pub fn is_numpad(vk: u32) -> bool {
     (VK_NUMPAD0.0 as u32..=VK_DIVIDE.0 as u32).contains(&vk)
 }
 
-/// 虚拟键码 → 按键。修饰键返回 None（永远不拦）。
+/// 虚拟键码 → 按键。修饰键、功能键、音量媒体键这些返回 None（永远不拦）。
 pub fn translate(vk: u32, lparam: isize) -> Option<Key> {
-    if is_modifier(vk) {
+    if is_modifier(vk) || crate::gate::never_intercept(vk) {
         return None;
     }
     let k = match vk {

@@ -1,7 +1,12 @@
 //! 输入法对象：每个程序的每个界面线程一个。接收按键、问引擎、改文档里的字。
 //!
 //! 和别的程序和平相处的规矩（详见 docs/方案.md「和别的程序不冲突」）：
-//! - 没在打字就什么都不显示、不拦任何键；Ctrl/Alt/Win 组合键、F1–F12、修饰键一律放过
+//! - 没在打字就什么都不显示、不拦任何键；Ctrl/Alt/Win 组合键、修饰键一律放过；
+//!   功能键、音量媒体键、截屏键、菜单键任何时候都放过
+//! - 按下和松开成对：程序收到了一个键的按下，就一定收到它的松开（见 gate.rs）。
+//!   否则网页、游戏以为这个键一直按着（B 站长按方向键开倍速、空格不暂停、游戏人物一直跑）
+//! - 引擎里的拼音和屏幕上的永远一致：这里开始不了输入（不是文字框），立刻清掉引擎里的拼音，
+//!   不会出现"屏幕上什么都没有，空格、方向键却被输入法拿走"
 //! - 下面这些情况所有键原样交给程序：没有输入框、只读、密码框、数字框、程序关掉了输入法、
 //!   引擎没运行或卡住（超过 0.3 秒）
 //! - 全屏游戏里默认不打字（按键全交给游戏）；单按一下 Shift 才临时打中文，回车或 Esc 发出去后自动恢复
@@ -11,7 +16,7 @@ use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 use pinyin_ipc::{Reply, Request};
-use pinyin_types::{Key, Mods};
+use pinyin_types::{Key, Mods, View};
 use windows::core::{implement, ComObject, IUnknownImpl, Interface, Ref, Result, BOOL, GUID};
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -34,6 +39,7 @@ use super::client::EngineClient;
 use super::edit::{Action, EditSession};
 use super::keys::{self, ShiftTracker};
 use super::{candwin, debug, guard};
+use crate::gate::{self, KeyGate};
 
 #[derive(Default)]
 struct State {
@@ -46,8 +52,14 @@ struct State {
     comp_ctx: Option<ITfContext>,
     client: EngineClient,
     shift: ShiftTracker,
-    /// 按下时被输入法吃掉的键：它们松开时也吃掉，程序不会收到只有"松开"的键
-    eaten: Vec<u32>,
+    /// 按下和松开配对
+    gate: KeyGate,
+    /// 引擎里有没打完的拼音（看最近一次回复）
+    engine_busy: bool,
+    /// 请求了"开始一段输入"、程序还没执行（排着队）：请求的时间
+    start_pending: Option<Instant>,
+    /// 记住的输入框：在这里开始过输入（好），或者开始不了（不是文字框，比如网页上的视频）
+    ctx_marks: Vec<CtxMark>,
     /// 全屏游戏里按 Shift 临时打开了中文
     game_chinese: bool,
     /// 上一次中英切换的时间：系统的"单按 Shift"和自己的检测可能都报一次，只切一次
@@ -71,6 +83,59 @@ fn preserved_keys() -> [(GUID, TF_PRESERVEDKEY); 2] {
 /// 两次报告之间不超过这么久，算同一次按键
 const SAME_TAP: Duration = Duration::from_millis(400);
 
+/// 排队的"开始输入"请求最多等这么久，还没执行就当作失败
+const PENDING: Duration = Duration::from_secs(2);
+
+/// "这里开始不了输入"记多久（换了输入框也会忘掉）
+const DEAD_FOR: Duration = Duration::from_secs(60);
+
+struct CtxMark {
+    ctx: ITfContext,
+    /// true：在这里成功开始过输入；false：开始不了
+    good: bool,
+    at: Instant,
+}
+
+fn same_ctx(a: &ITfContext, b: &ITfContext) -> bool {
+    a.as_raw() == b.as_raw()
+}
+
+fn mark_ctx(st: &mut State, ctx: &ITfContext, good: bool) {
+    if let Some(m) = st.ctx_marks.iter_mut().find(|m| same_ctx(&m.ctx, ctx)) {
+        // 成功输入过的输入框，不会因为一次失败（程序正忙）就被当成不能打字
+        if !(m.good && !good) {
+            m.good = good;
+            m.at = Instant::now();
+        }
+        return;
+    }
+    if st.ctx_marks.len() >= 16 {
+        st.ctx_marks.remove(0);
+    }
+    st.ctx_marks.push(CtxMark { ctx: ctx.clone(), good, at: Instant::now() });
+}
+
+/// 诊断日志：只记不会打出字的键（空格、回车、方向键……），绝不记打的字。
+fn log_key(vk: u32, what: &str, eaten: bool) {
+    if debug::enabled() {
+        if let Some(name) = gate::key_label(vk) {
+            debug::log(&format!("{what} {name}：{}", if eaten { "输入法用了" } else { "交给程序" }));
+        }
+    }
+}
+
+/// 一次"编辑会话"请求的结果
+pub struct Edited {
+    /// 已经执行了（同步执行）
+    pub ran: bool,
+    /// 程序接受了（已经执行，或者排上队了）
+    pub accepted: bool,
+    /// 请求本身就出错了（输入框已经不在了之类）
+    pub error: bool,
+    /// 只读检查的结果
+    pub result: bool,
+}
+
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfThreadMgrEventSink, ITfCompositionSink)]
 pub struct TextService {
     st: RefCell<State>,
@@ -91,8 +156,37 @@ impl TextService {
 
     pub fn set_composition(&self, c: Option<ITfComposition>, ctx: Option<ITfContext>) {
         let mut st = self.st.borrow_mut();
+        if c.is_some() {
+            st.start_pending = None;
+            if let Some(x) = &ctx {
+                mark_ctx(&mut st, x, true);
+            }
+        }
         st.composition = c;
         st.comp_ctx = ctx;
+    }
+
+    /// 这里开始不了输入（网页上没有输入框的地方、不接受文字的控件）：
+    /// 清掉引擎里的拼音，收起候选窗，记住这个地方（接下来的按键直接交给程序）。
+    pub fn compose_failed(&self, ctx: &ITfContext) {
+        debug::log("这里开始不了输入（不是文字框）：清掉引擎里的拼音，按键交给程序");
+        candwin::hide();
+        {
+            let mut st = self.st.borrow_mut();
+            st.start_pending = None;
+            mark_ctx(&mut st, ctx, false);
+        }
+        self.reset_engine();
+    }
+
+    /// 清空引擎里正在打的拼音（上文保留）。
+    fn reset_engine(&self) {
+        self.notify(&Request::Reset);
+        self.st.borrow_mut().engine_busy = false;
+    }
+
+    fn ctx_dead(&self, ctx: &ITfContext) -> bool {
+        self.st.borrow().ctx_marks.iter().any(|m| same_ctx(&m.ctx, ctx) && !m.good && m.at.elapsed() < DEAD_FOR)
     }
 
     fn composing(&self) -> bool {
@@ -100,7 +194,24 @@ impl TextService {
     }
 
     fn call(&self, req: &Request) -> Option<Reply> {
-        self.st.borrow_mut().client.call(req)
+        let mut st = self.st.borrow_mut();
+        let r = st.client.call(req);
+        if r.is_none() {
+            // 连接断了：重新连上时引擎那边是全新的，没有拼音
+            st.engine_busy = false;
+        }
+        r
+    }
+
+    /// 把一个按键交给引擎处理，记下引擎里还有没有拼音。
+    fn key_call(&self, key: Key, mods: Mods) -> Option<(bool, Option<String>, View)> {
+        match self.call(&Request::Key { key, mods }) {
+            Some(Reply::KeyResult { consumed, commit, view }) => {
+                self.st.borrow_mut().engine_busy = view.composing;
+                Some((consumed, commit, view))
+            }
+            _ => None,
+        }
     }
 
     /// 只在已经连上引擎时才发（切换焦点之类的通知不值得为它启动引擎）。
@@ -138,7 +249,7 @@ fn has_system_caret() -> bool {
 }
 
 impl TextService_Impl {
-    fn edit(&self, ctx: &ITfContext, action: Action, sync: bool) -> bool {
+    fn edit(&self, ctx: &ITfContext, action: Action, sync: bool) -> Edited {
         let tid = self.tid();
         let es = ComObject::new(EditSession::new(ctx.clone(), self.to_object(), action));
         let i: ITfEditSession = es.to_interface();
@@ -148,13 +259,17 @@ impl TextService_Impl {
             (false, true) => TF_ES_SYNC | TF_ES_READWRITE,
             (false, false) => TF_ES_ASYNCDONTCARE | TF_ES_READWRITE,
         };
-        let mut ok = unsafe { ctx.RequestEditSession(tid, &i, flags) }.is_ok_and(|hr| hr.is_ok());
-        if !ok && sync && !check {
+        let mut r = unsafe { ctx.RequestEditSession(tid, &i, flags) };
+        if !r.as_ref().is_ok_and(|hr| hr.is_ok()) && sync && !check {
             // 程序这会儿不让立刻改：排队稍后改（字不会丢）
-            ok = unsafe { ctx.RequestEditSession(tid, &i, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE) }
-                .is_ok_and(|hr| hr.is_ok());
+            r = unsafe { ctx.RequestEditSession(tid, &i, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE) };
         }
-        ok && es.result.get()
+        Edited {
+            ran: es.ran.get(),
+            accepted: r.as_ref().is_ok_and(|hr| hr.is_ok()),
+            error: r.is_err(),
+            result: es.result.get(),
+        }
     }
 
     /// 结束正在打的拼音（字留在文档里），比如切换了输入框。
@@ -172,6 +287,10 @@ impl TextService_Impl {
 
     /// 这个输入框里输入法该不该工作。
     fn blocked(&self, ctx: &ITfContext) -> bool {
+        // 刚试过，这里开始不了输入
+        if self.ctx_dead(ctx) {
+            return true;
+        }
         unsafe {
             // 程序或用户关掉了输入法（Ctrl+空格、ImmSetOpenStatus）
             let tm = self.st.borrow().tm.clone();
@@ -196,8 +315,9 @@ impl TextService_Impl {
                 }
             }
         }
-        // 密码框、数字框
-        self.edit(ctx, Action::CheckScope, true)
+        // 密码框、数字框；连读一下都不行的（输入框已经没了）
+        let e = self.edit(ctx, Action::CheckScope, true);
+        e.error || (e.ran && e.result)
     }
 
     /// 全屏游戏：全屏，又不是真正的文字输入框（没有光标的老式窗口）。
@@ -211,7 +331,23 @@ impl TextService_Impl {
         transitory && !has_system_caret()
     }
 
-    fn test_key_down(&self, ctx: Option<ITfContext>, vk: u32, lp: isize) -> bool {
+    /// 引擎里有拼音、屏幕上却没有（开始输入失败了，或者程序一直没执行我们的请求）：清掉。
+    /// 不然引擎以为还在打字，空格、方向键都会被拿走，而用户什么也看不到。
+    fn drop_hidden_input(&self) {
+        let stale = {
+            let st = self.st.borrow();
+            st.engine_busy && !st.start_pending.is_some_and(|t| t.elapsed() < PENDING)
+        };
+        if stale {
+            debug::log("引擎里有屏幕上看不到的拼音：清掉");
+            candwin::hide();
+            self.st.borrow_mut().start_pending = None;
+            self.reset_engine();
+        }
+    }
+
+    /// 一次按下要不要（只判断，真正处理在 key_down）。
+    fn decide_down(&self, ctx: Option<ITfContext>, vk: u32, lp: isize) -> bool {
         if keys::is_shift(vk) {
             let repeat = lp & (1 << 30) != 0;
             self.st.borrow_mut().shift.shift_down(repeat);
@@ -225,12 +361,15 @@ impl TextService_Impl {
         let Some(key) = keys::translate(vk, lp) else { return false };
         let mods = keys::mods();
         let composing = self.composing();
+        if !composing {
+            self.drop_hidden_input();
+        }
         if composing {
             // 打到一半按了快捷键（Ctrl+S、Alt+Tab……）：先把打的字母原样上屏，再把快捷键交给程序。
             // 在这里就做完，不等 OnKeyDown：按键一旦说了"要"，老式程序就收不到原来的键了
             if mods.ctrl || mods.alt {
-                match self.call(&Request::Key { key, mods }) {
-                    Some(Reply::KeyResult { commit, view, .. }) => {
+                match self.key_call(key, mods) {
+                    Some((_, commit, view)) => {
                         self.edit(&ctx, Action::Update { commit, view, flash: None }, true);
                     }
                     _ => self.end_composition(),
@@ -256,6 +395,12 @@ impl TextService_Impl {
                 true
             }
             Some(Reply::Bool(false)) => {
+                if composing {
+                    // 屏幕上还有拼音，引擎却不接这个键了（引擎重启过、别的程序里切成了纯英文）：
+                    // 结束这段，字母留在原处
+                    self.end_composition();
+                    self.reset_engine();
+                }
                 self.pass_through(key, mods);
                 false
             }
@@ -271,9 +416,9 @@ impl TextService_Impl {
 
     /// 放过的键也告诉引擎一声：打了数字、回车、方向键之后上文就变了。
     fn pass_through(&self, key: Key, mods: Mods) {
-        if let Some(Reply::KeyResult { consumed: true, .. }) = self.call(&Request::Key { key, mods }) {
+        if let Some((true, ..)) = self.key_call(key, mods) {
             // 两边不一致（不该发生）：丢掉引擎里的状态
-            self.notify(&Request::Reset);
+            self.reset_engine();
         }
         if matches!(key, Key::Enter | Key::Escape) {
             // 游戏里聊天发出去了 / 关掉了：恢复成按键全交给游戏
@@ -281,26 +426,35 @@ impl TextService_Impl {
         }
     }
 
+    /// 真正处理一个说了"要"的按键。返回最后有没有用掉它。
     fn key_down(&self, ctx: Option<ITfContext>, vk: u32, lp: isize) -> bool {
         let Some(ctx) = ctx else { return false };
         let Some(key) = keys::translate(vk, lp) else { return false };
         let mods = keys::mods();
-        match self.call(&Request::Key { key, mods }) {
-            Some(Reply::KeyResult { consumed, commit, view }) => {
-                if consumed || commit.is_some() || self.composing() {
-                    self.edit(&ctx, Action::Update { commit, view, flash: None }, false);
-                }
-                if consumed {
-                    let mut st = self.st.borrow_mut();
-                    if st.eaten.len() >= 16 {
-                        st.eaten.clear();
+        let was_composing = self.composing();
+        match self.key_call(key, mods) {
+            Some((consumed, commit, view)) => {
+                let starting = !was_composing && view.composing;
+                if consumed || commit.is_some() || was_composing {
+                    let e = self.edit(&ctx, Action::Update { commit, view, flash: None }, false);
+                    if starting {
+                        if e.ran {
+                            if !self.composing() {
+                                // 开始不了（compose_failed 已经清掉了引擎里的拼音）：这个键还给程序
+                                return false;
+                            }
+                        } else if e.accepted {
+                            self.st.borrow_mut().start_pending = Some(Instant::now());
+                        } else {
+                            self.compose_failed(&ctx);
+                            return false;
+                        }
                     }
-                    st.eaten.push(vk);
                 }
                 consumed
             }
-            _ => {
-                if self.composing() {
+            None => {
+                if was_composing {
                     self.end_composition();
                 }
                 false
@@ -308,7 +462,62 @@ impl TextService_Impl {
         }
     }
 
-    fn test_key_up(&self, ctx: Option<ITfContext>, vk: u32) -> bool {
+    // ---- 按下、松开的四个入口：每次按键只判断一次，按下和松开成对（见 gate.rs） ----
+
+    fn on_test_key_down(&self, ctx: Option<ITfContext>, vk: u32, lp: isize) -> bool {
+        let now = Instant::now();
+        let cached = self.st.borrow_mut().gate.test_down_cached(vk, lp, now);
+        if let Some(eat) = cached {
+            return eat;
+        }
+        let eat = self.decide_down(ctx, vk, lp);
+        self.st.borrow_mut().gate.tested_down(vk, lp, eat, now);
+        log_key(vk, "按下（问）", eat);
+        eat
+    }
+
+    fn on_key_down(&self, ctx: Option<ITfContext>, vk: u32, lp: isize) -> bool {
+        let now = Instant::now();
+        let cached = self.st.borrow_mut().gate.key_down_cached(vk, lp, now);
+        let eat = match cached {
+            Some(e) => e,
+            None => self.decide_down(ctx.clone(), vk, lp),
+        };
+        let eaten = eat && self.key_down(ctx, vk, lp);
+        self.st.borrow_mut().gate.finished_down(vk, eaten);
+        if cached.is_none() || eaten != eat {
+            log_key(vk, "按下", eaten);
+        }
+        eaten
+    }
+
+    fn on_test_key_up(&self, ctx: Option<ITfContext>, vk: u32) -> bool {
+        let now = Instant::now();
+        let cached = self.st.borrow_mut().gate.up_cached(vk, now, false);
+        if let Some(eat) = cached {
+            return eat;
+        }
+        let eat = self.decide_up(ctx, vk);
+        self.st.borrow_mut().gate.tested_up(vk, eat, now);
+        log_key(vk, "松开（问）", eat);
+        eat
+    }
+
+    fn on_key_up(&self, ctx: Option<ITfContext>, vk: u32) -> bool {
+        let now = Instant::now();
+        let cached = self.st.borrow_mut().gate.up_cached(vk, now, true);
+        match cached {
+            Some(eat) => eat,
+            None => {
+                let eat = self.decide_up(ctx, vk);
+                log_key(vk, "松开", eat);
+                eat
+            }
+        }
+    }
+
+    /// 一次松开要不要：只有按下被输入法用掉的键才要。
+    fn decide_up(&self, ctx: Option<ITfContext>, vk: u32) -> bool {
         if keys::is_shift(vk) {
             let (desc, tap) = {
                 let mut st = self.st.borrow_mut();
@@ -323,23 +532,18 @@ impl TextService_Impl {
             // Shift 松开永远交给程序
             return false;
         }
-        let mut st = self.st.borrow_mut();
-        if let Some(i) = st.eaten.iter().position(|&k| k == vk) {
-            st.eaten.swap_remove(i);
-            return true;
-        }
-        false
+        self.st.borrow_mut().gate.decide_up(vk)
     }
 
     fn recently_toggled(&self) -> bool {
         self.st.borrow().last_toggle.is_some_and(|t| t.elapsed() < SAME_TAP)
     }
 
-    /// 系统报告"单独按了一下 Shift"（保留键）。返回 true 表示切换了。
-    fn preserved_shift(&self, ctx: Option<ITfContext>) -> bool {
+    /// 系统报告"单独按了一下 Shift"（保留键）。
+    fn preserved_shift(&self, ctx: Option<ITfContext>) {
         if self.recently_toggled() {
             debug::log("Shift 松开（系统保留键）：刚切过，忽略");
-            return false;
+            return;
         }
         let (desc, preview) = {
             let mut st = self.st.borrow_mut();
@@ -352,10 +556,9 @@ impl TextService_Impl {
         debug::log(&format!("Shift 松开（系统保留键）：{desc}"));
         // 自己的检测看到了这次按下，而且看到中间点了鼠标或按了别的键：不算
         if preview == Some(false) {
-            return false;
+            return;
         }
         self.shift_tap(ctx);
-        true
     }
 
     /// 单按一下 Shift：中文 ↔ 纯英文；在光标旁边闪一下"中"或"英"。
@@ -377,8 +580,8 @@ impl TextService_Impl {
                 return;
             }
         }
-        match self.call(&Request::Key { key: Key::ShiftTap, mods: Mods::default() }) {
-            Some(Reply::KeyResult { commit, view, .. }) => {
+        match self.key_call(Key::ShiftTap, Mods::default()) {
+            Some((_, commit, view)) => {
                 debug::log(&format!("切换成 {}", if view.english_mode { "纯英文" } else { "中文" }));
                 let flash = if view.english_mode { "英" } else { "中" };
                 if let Some(ctx) = &ctx {
@@ -396,11 +599,14 @@ impl TextService_Impl {
 
     fn focus_changed(&self) {
         self.end_composition();
-        self.notify(&Request::Reset);
+        self.reset_engine();
         self.notify(&Request::ClearContext);
         let mut st = self.st.borrow_mut();
         st.game_chinese = false;
-        st.eaten.clear();
+        st.gate.clear();
+        st.start_pending = None;
+        // 换了地方："开始不了输入"的记录作废，回来时再试一次
+        st.ctx_marks.retain(|m| m.good);
     }
 }
 
@@ -444,10 +650,12 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
                         }
                     }
                 }
-                self.notify(&Request::Reset);
+                self.reset_engine();
                 let mut st = self.st.borrow_mut();
                 st.client.disconnect();
-                st.eaten.clear();
+                st.gate.clear();
+                st.ctx_marks.clear();
+                st.start_pending = None;
                 Ok(())
             },
             Ok(()),
@@ -510,29 +718,30 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
     }
 
     fn OnTestKeyDown(&self, pic: Ref<ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
-        Ok(guard(|| self.test_key_down(pic.cloned(), wparam.0 as u32, lparam.0), false).into())
+        Ok(guard(|| self.on_test_key_down(pic.cloned(), wparam.0 as u32, lparam.0), false).into())
     }
 
     fn OnTestKeyUp(&self, pic: Ref<ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
-        Ok(guard(|| self.test_key_up(pic.cloned(), wparam.0 as u32), false).into())
+        Ok(guard(|| self.on_test_key_up(pic.cloned(), wparam.0 as u32), false).into())
     }
 
     fn OnKeyDown(&self, pic: Ref<ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
-        Ok(guard(|| self.key_down(pic.cloned(), wparam.0 as u32, lparam.0), false).into())
+        Ok(guard(|| self.on_key_down(pic.cloned(), wparam.0 as u32, lparam.0), false).into())
     }
 
-    fn OnKeyUp(&self, _pic: Ref<ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
-        // 只有 OnTestKeyUp 说要吃的键才会到这里（它已经从列表里删掉了）
-        let _ = wparam;
-        Ok(true.into())
+    /// 有的程序不先问 OnTestKeyUp 就直接调这里：照样只吃按下被用掉的键（以前这里一律吃掉）。
+    fn OnKeyUp(&self, pic: Ref<ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+        Ok(guard(|| self.on_key_up(pic.cloned(), wparam.0 as u32), false).into())
     }
 
+    /// 切换照做，但永远告诉系统"这个键没用掉"：Shift 的松开要交给程序，
+    /// 不然游戏、网页会以为 Shift 一直按着（一直冲刺、一直多选）。
     fn OnPreservedKey(&self, pic: Ref<ITfContext>, rguid: *const GUID) -> Result<BOOL> {
         let ours = !rguid.is_null() && unsafe { *rguid == PRESERVE_SHIFT || *rguid == PRESERVE_SHIFT2 };
-        if !ours {
-            return Ok(false.into());
+        if ours {
+            guard(|| self.preserved_shift(pic.cloned()), ());
         }
-        Ok(guard(|| self.preserved_shift(pic.cloned()), false).into())
+        Ok(false.into())
     }
 }
 
@@ -566,7 +775,7 @@ impl ITfCompositionSink_Impl for TextService_Impl {
             || {
                 self.set_composition(None, None);
                 candwin::hide();
-                self.notify(&Request::Reset);
+                self.reset_engine();
             },
             (),
         );
