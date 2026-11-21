@@ -16,7 +16,8 @@ use windows::Win32::System::Registry::{
 use windows::Win32::UI::Input::KeyboardAndMouse::HKL;
 use windows::Win32::UI::TextServices::{
     CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles, ITfCategoryMgr, ITfInputProcessorProfileMgr,
-    GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT, GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT, GUID_TFCAT_TIP_KEYBOARD,
+    ITfInputProcessorProfiles, GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT, GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
+    GUID_TFCAT_TIP_KEYBOARD,
 };
 
 use super::{dll_instance, CLSID_PINYIN, GUID_PROFILE, LANGID_ZH_CN};
@@ -115,6 +116,16 @@ pub fn unregister() -> Result<()> {
                 let _ = cm.UnregisterCategory(&CLSID_PINYIN, &c, &CLSID_PINYIN);
             }
         }
+        // 旧接口能把整个输入法登记删干净（新接口只删配置，会留下空的登记）
+        if let Ok(pp) = CoCreateInstance::<_, ITfInputProcessorProfiles>(
+            &CLSID_TF_InputProcessorProfiles,
+            None,
+            CLSCTX_INPROC_SERVER,
+        ) {
+            let _ = pp.Unregister(&CLSID_PINYIN);
+        }
+        let tip = format!("Software\\Microsoft\\CTF\\TIP\\{}", pinyin_types::guid_string(pinyin_types::TIP_CLSID));
+        let _ = RegDeleteTreeW(HKEY_LOCAL_MACHINE, &HSTRING::from(tip));
         let r = RegDeleteTreeW(HKEY_LOCAL_MACHINE, &HSTRING::from(clsid_key()));
         if r != ERROR_SUCCESS && r != ERROR_FILE_NOT_FOUND {
             return r.ok();
