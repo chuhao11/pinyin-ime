@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/engine", "crates/dictgen", "crates/cli", "crates/lmgen", "crates/types", "crates/ipc", "crates/tsf"]
+members = ["crates/engine", "crates/dictgen", "crates/cli", "crates/lmgen", "crates/types", "crates/ipc", "crates/winpipe", "crates/winsrv", "crates/tsf"]
 
 [workspace.package]
 version = "0.1.0"

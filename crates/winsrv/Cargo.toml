@@ -1,0 +1,17 @@
+[package]
+name = "pinyin-winsrv"
+description = "引擎进程：在后台等各个程序里的输入法连进来"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "pinyin-engine"
+path = "src/main.rs"
+
+[dependencies]
+pinyin-engine = { path = "../engine" }
+pinyin-ipc = { path = "../ipc" }
+
+[target."cfg(windows)".dependencies]
+pinyin-winpipe = { path = "../winpipe" }

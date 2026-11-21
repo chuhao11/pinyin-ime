@@ -1,0 +1,12 @@
+[package]
+name = "pinyin-winpipe"
+description = "Windows 命名管道：输入法 DLL 和引擎进程之间的安全连接"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "pinyin_winpipe"
+
+[target."cfg(windows)".dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_IO"] }

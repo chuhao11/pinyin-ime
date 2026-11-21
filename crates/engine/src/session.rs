@@ -83,8 +83,6 @@ pub struct Session {
     mode: Mode,
     /// 上文：刚上屏的最后一个词和上屏时间。只在内存里，不保存。
     ctx: Option<(u32, i64)>,
-    /// 刚打了一个数字（后面的 . , : 保持英文，比如 3.14、12:30）
-    after_digit: bool,
     /// 中文引号是不是正开着（下一个是右引号）
     dq_open: bool,
     sq_open: bool,
@@ -106,7 +104,6 @@ impl Session {
     /// 忘掉上文（比如光标移走了）。
     pub fn clear_context(&mut self) {
         self.ctx = None;
-        self.after_digit = false;
     }
 
     /// 清空正在打的拼音。
@@ -146,11 +143,11 @@ pub fn display_width(s: &str) -> usize {
     s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
 }
 
-/// 中文标点。`after_digit` 时 . , : 保持英文（3.14、1,000、12:30）。
+/// 有中文写法的标点。中文标点开着时，这些键全部变成中文标点，没有例外；关着时全部是英文。
+const ZH_PUNCT_KEYS: &str = ",.?!:;()[]{}<>\\^_$~`\"'";
+
+/// 中文标点（开关打开时用）。
 fn zh_punct(c: char, s: &mut Session) -> Option<&'static str> {
-    if s.after_digit && matches!(c, '.' | ',' | ':') {
-        return None;
-    }
     Some(match c {
         ',' => "，",
         '.' => "。",
@@ -162,6 +159,8 @@ fn zh_punct(c: char, s: &mut Session) -> Option<&'static str> {
         ')' => "）",
         '[' => "【",
         ']' => "】",
+        '{' => "｛",
+        '}' => "｝",
         '<' => "《",
         '>' => "》",
         '\\' => "、",
@@ -169,6 +168,7 @@ fn zh_punct(c: char, s: &mut Session) -> Option<&'static str> {
         '_' => "——",
         '$' => "￥",
         '~' => "～",
+        '`' => "·",
         '"' => {
             s.dq_open = !s.dq_open;
             if s.dq_open {
@@ -260,30 +260,7 @@ impl Engine {
         }
         match key {
             Key::Char(c) if c.is_ascii_alphabetic() => !mods.caps_lock,
-            Key::Char(c) if self.config.chinese_punct => {
-                !(s.after_digit && matches!(c, '.' | ',' | ':'))
-                    && matches!(
-                        c,
-                        ',' | '.'
-                            | '?'
-                            | '!'
-                            | ':'
-                            | ';'
-                            | '('
-                            | ')'
-                            | '['
-                            | ']'
-                            | '<'
-                            | '>'
-                            | '\\'
-                            | '^'
-                            | '_'
-                            | '$'
-                            | '~'
-                            | '"'
-                            | '\''
-                    )
-            }
+            Key::Char(c) if self.config.chinese_punct => ZH_PUNCT_KEYS.contains(c),
             _ => false,
         }
     }
@@ -325,7 +302,6 @@ impl Engine {
             let digit = matches!(key, Key::Char(c) if c.is_ascii_digit());
             s.ctx =
                 if digit { self.lm.as_ref().and_then(|l| l.id(NUM_TOKEN)).map(|id| (id, self.now())) } else { None };
-            s.after_digit = digit;
             return Response::pass();
         }
         match s.mode {
@@ -598,7 +574,6 @@ impl Engine {
             (None, Some(id)) => Some((id, now)),
             _ => None,
         };
-        s.after_digit = false;
         if let Some(e) = extra {
             text.push_str(&e);
         }
@@ -918,14 +893,29 @@ mod tests {
         // 引号一左一右
         assert_eq!(key(&mut m, Key::Char('"')).commit.as_deref(), Some("“"));
         assert_eq!(key(&mut m, Key::Char('"')).commit.as_deref(), Some("”"));
-        // 数字后面的小数点、冒号保持英文
+        // 开着时全部是中文标点，没有例外（数字后面也是）
         assert_eq!(key(&mut m, Key::Char('3')), Response::pass());
-        assert_eq!(key(&mut m, Key::Char('.')), Response::pass());
+        assert_eq!(key(&mut m, Key::Char('.')).commit.as_deref(), Some("。"));
+        for (k, want) in [
+            ('(', "（"),
+            ('[', "【"),
+            ('{', "｛"),
+            ('<', "《"),
+            ('\\', "、"),
+            ('^', "……"),
+            ('_', "——"),
+            ('$', "￥"),
+            ('`', "·"),
+        ] {
+            assert_eq!(key(&mut m, Key::Char(k)).commit.as_deref(), Some(want), "{k}");
+        }
         // 空格永远是半角，原样交给程序
         assert_eq!(key(&mut m, Key::Space), Response::pass());
         // 关掉以后全是英文
         m.engine_mut().config.chinese_punct = false;
-        assert_eq!(key(&mut m, Key::Char(',')), Response::pass());
+        for c in ",.?!:;()[]{}<>\\^_$~`\"'".chars() {
+            assert_eq!(key(&mut m, Key::Char(c)), Response::pass(), "{c}");
+        }
         assert_eq!(typ(&mut m, "nihao,"), "你好,");
     }
 

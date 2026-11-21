@@ -284,6 +284,22 @@ name = "pinyin-types"
 version = "0.1.0"
 
 [[package]]
+name = "pinyin-winpipe"
+version = "0.1.0"
+dependencies = [
+ "windows",
+]
+
+[[package]]
+name = "pinyin-winsrv"
+version = "0.1.0"
+dependencies = [
+ "pinyin-engine",
+ "pinyin-ipc",
+ "pinyin-winpipe",
+]
+
+[[package]]
 name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
