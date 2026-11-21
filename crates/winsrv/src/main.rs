@@ -21,17 +21,6 @@ use pinyin_ipc::{read_frame, write_frame, Reply, Request};
 /// 日志最大字节数（超过就从头写），日志里不记任何打字内容。
 const LOG_MAX: u64 = 256 * 1024;
 
-fn user_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("PINYIN_USER_DIR") {
-        return PathBuf::from(p);
-    }
-    #[cfg(windows)]
-    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
-    #[cfg(not(windows))]
-    let base = std::env::var("HOME").map(|h| format!("{h}/.pinyin-ime-engine")).unwrap_or_else(|_| ".".into());
-    PathBuf::from(base).join("PinyinIME")
-}
-
 fn data_dir() -> PathBuf {
     if let Ok(p) = std::env::var("PINYIN_DATA") {
         return PathBuf::from(p);
@@ -92,7 +81,7 @@ fn watch_settings(svc: Arc<Mutex<Service>>, path: PathBuf) {
 }
 
 fn main() {
-    let user = user_dir();
+    let user = pinyin_ipc::user_dir();
     let data = data_dir();
     let svc = match load(&data, &user) {
         Ok(s) => Arc::new(Mutex::new(s)),

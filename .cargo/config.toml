@@ -1,0 +1,10 @@
+# Windows 上把 C 运行库静态链接进去：新装的 Windows 没有 VC++ 运行库也能用
+# （输入法 DLL 会被加载进各种程序，绝不能因为缺一个运行库就加载失败）。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

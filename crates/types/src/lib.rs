@@ -1,6 +1,16 @@
 //! 输入法各部分共用的简单类型：按键、修饰键、候选窗要显示的内容。
 //! 单独放一个没有任何依赖的小库，这样每个程序里加载的 DLL 只需要它和通信协议，不用带上词库、数据库。
 
+/// 输入法在 Windows 里的编号（COM 类）和"中文(简体)"下的配置编号。永远不变（变了会被当成另一个输入法）。
+pub const TIP_CLSID: u128 = 0x4d576843_6f05_43dc_b08f_fc06ae6d83f7;
+pub const TIP_PROFILE: u128 = 0x2f1ff890_9808_4af9_8ca1_32893cb7bd5e;
+
+/// `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` 形式（注册表、系统设置里用）。
+pub fn guid_string(g: u128) -> String {
+    let h = format!("{g:032X}");
+    format!("{{{}-{}-{}-{}-{}}}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+}
+
 /// 按键。`Char` 是这个键实际打出的字符（已经考虑了 Shift），比如 Shift+1 是 `Char('!')`。
 /// `ShiftTap` 是"单独按一下 Shift"（按下再松开，中间没按别的键），用来切换中文 / 纯英文。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,4 +81,14 @@ pub struct View {
     pub corrected: Vec<bool>,
     /// 现在是纯英文输入
     pub english_mode: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guid_format() {
+        assert_eq!(guid_string(TIP_CLSID), "{4D576843-6F05-43DC-B08F-FC06AE6D83F7}");
+    }
 }

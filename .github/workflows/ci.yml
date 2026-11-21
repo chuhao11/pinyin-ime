@@ -36,6 +36,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
           rustup default stable
+          if [ "$RUNNER_OS" = "Windows" ]; then rustup target add i686-pc-windows-msvc; fi
           rustc --version
 
       - name: 检查格式和代码规范
@@ -59,3 +60,114 @@ jobs:
         env:
           REQUIRE_DICT: "1"
         run: cargo test --release --workspace -- --nocapture
+
+      # ---------------- 下面只在 Windows 上：编译、检查、打包安装程序 ----------------
+
+      - name: 编译 Windows 程序（引擎、设置页、64 位和 32 位输入法 DLL）
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo build --release -p pinyin-winsrv -p pinyin-settings
+          cargo build --release -p pinyin-tsf --target x86_64-pc-windows-msvc
+          cargo build --release -p pinyin-tsf --target i686-pc-windows-msvc
+
+      - name: 检查 DLL 的入口名和依赖（不依赖 VC++ 运行库）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products * -find "VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          $dlls = "target\x86_64-pc-windows-msvc\release\pinyin_tsf.dll", "target\i686-pc-windows-msvc\release\pinyin_tsf.dll"
+          foreach ($d in $dlls) {
+            $out = & $dumpbin /nologo /exports $d | Out-String
+            Write-Host $out
+            foreach ($n in "DllGetClassObject", "DllCanUnloadNow", "DllRegisterServer", "DllUnregisterServer") {
+              if ($out -notmatch "\s$n(\s|$)") { throw "$d 没有导出 $n（32 位要求不带 @ 修饰）" }
+            }
+          }
+          foreach ($f in $dlls + "target\release\pinyin-engine.exe", "target\release\pinyin-settings.exe") {
+            $deps = & $dumpbin /nologo /dependents $f | Out-String
+            Write-Host $deps
+            if ($deps -match "(?i)vcruntime|msvcp|api-ms-win-crt") { throw "$f 依赖 VC++ 运行库" }
+          }
+
+      - name: 注册、注销输入法 DLL
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $clsid = "{4D576843-6F05-43DC-B08F-FC06AE6D83F7}"
+          $tip = "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$clsid"
+          $pairs = @(("$env:WINDIR\System32\regsvr32.exe", "target\x86_64-pc-windows-msvc\release\pinyin_tsf.dll"),
+                     ("$env:WINDIR\SysWOW64\regsvr32.exe", "target\i686-pc-windows-msvc\release\pinyin_tsf.dll"))
+          foreach ($p in $pairs) {
+            $r = Start-Process $p[0] -ArgumentList "/s", (Resolve-Path $p[1]) -Wait -PassThru
+            if ($r.ExitCode -ne 0) { throw "注册失败：$($p[1])（$($r.ExitCode)）" }
+          }
+          if (-not (Test-Path $tip)) { throw "TSF 里没有登记" }
+          Get-ChildItem $tip -Recurse | Out-Host
+          foreach ($p in $pairs) {
+            $r = Start-Process $p[0] -ArgumentList "/u", "/s", (Resolve-Path $p[1]) -Wait -PassThru
+            if ($r.ExitCode -ne 0) { throw "注销失败：$($p[1])（$($r.ExitCode)）" }
+          }
+          if (Test-Path "$tip\LanguageProfile\0x00000804") { throw "注销后还在" }
+
+      - name: 整理安装文件
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          rm -rf dist && mkdir -p dist/stage/data
+          cp target/release/pinyin-engine.exe target/release/pinyin-settings.exe dist/stage/
+          cp target/x86_64-pc-windows-msvc/release/pinyin_tsf.dll dist/stage/pinyin-tsf64.dll
+          cp target/i686-pc-windows-msvc/release/pinyin_tsf.dll dist/stage/pinyin-tsf32.dll
+          cp assets/icon/pinyin.ico dist/stage/
+          cp assets/icon/pinyin-256.png dist/stage/pinyin.png
+          cp data/build/pinyin.dict data/build/english.tsv data/build/pinyin.lm data/build/pinyin-formal.lm dist/stage/data/
+          ls -la dist/stage dist/stage/data
+
+      - name: 生成安装程序
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y | Out-Host }
+          & $iscc /Q "/DAppVer=0.1.${{ github.run_number }}" installer\pinyin.iss
+          if ($LASTEXITCODE -ne 0) { throw "生成安装程序失败" }
+          Get-ChildItem dist\*.exe | Out-Host
+
+      - name: 试装、检查、再卸载（在 CI 的虚拟机里）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $clsid = "{4D576843-6F05-43DC-B08F-FC06AE6D83F7}"
+          $tip = "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$clsid"
+          $app = "$env:ProgramFiles\PinyinIME"
+          $setup = Get-ChildItem dist\PinyinIME-Setup-*.exe | Select-Object -First 1
+          $r = Start-Process $setup.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=dist\install.log" -Wait -PassThru
+          if ($r.ExitCode -ne 0) { Get-Content dist\install.log; throw "安装失败（$($r.ExitCode)）" }
+          foreach ($f in "pinyin-engine.exe", "pinyin-settings.exe", "pinyin-tsf64.dll", "pinyin-tsf32.dll", "pinyin.ico", "pinyin.png", "data\pinyin.dict", "data\english.tsv", "data\pinyin.lm", "data\pinyin-formal.lm") {
+            if (-not (Test-Path "$app\$f")) { throw "缺少 $f" }
+          }
+          if (-not (Test-Path "$tip\LanguageProfile\0x00000804")) { throw "输入法没注册" }
+          if (-not (Get-ItemProperty "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run" -Name PinyinIME -ErrorAction SilentlyContinue)) { throw "没有登录自动启动" }
+          $ok = $false
+          for ($i = 0; $i -lt 30; $i++) { if (Get-Process pinyin-engine -ErrorAction SilentlyContinue) { $ok = $true; break }; Start-Sleep 1 }
+          if (-not $ok) { throw "引擎没启动" }
+          Start-Sleep 5
+          if (-not (Get-Process pinyin-engine -ErrorAction SilentlyContinue)) { Get-Content "$env:APPDATA\PinyinIME\engine.log" -ErrorAction SilentlyContinue; throw "引擎启动后退出了" }
+          Get-Content "$env:APPDATA\PinyinIME\engine.log" -ErrorAction SilentlyContinue
+          Get-Process pinyin-engine | Format-Table Id, WorkingSet64, PrivateMemorySize64 | Out-Host
+
+          $r = Start-Process "$app\unins000.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait -PassThru
+          for ($i = 0; $i -lt 60 -and (Test-Path "$app\unins000.exe"); $i++) { Start-Sleep 1 }
+          if (Test-Path "$tip\LanguageProfile\0x00000804") { throw "卸载后输入法还在" }
+          if (Get-Process pinyin-engine -ErrorAction SilentlyContinue) { throw "卸载后引擎还在运行" }
+          if (Get-ItemProperty "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run" -Name PinyinIME -ErrorAction SilentlyContinue) { throw "卸载后自动启动还在" }
+
+      - name: 上传安装程序
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: PinyinIME-Setup
+          path: dist/PinyinIME-Setup-*.exe
+          retention-days: 30
+          compression-level: 0

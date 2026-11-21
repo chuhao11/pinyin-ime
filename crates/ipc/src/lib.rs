@@ -7,7 +7,7 @@
 //! 只在本机、只在本人账户下通信（Windows 的命名管道权限见 winsrv）。
 
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use pinyin_types::{Key, Mode, Mods, View};
 
@@ -370,6 +370,23 @@ pub fn call<S: Read + Write>(s: &mut S, req: &Request) -> io::Result<Reply> {
 }
 
 // ---------------- 设置 ----------------
+
+/// 你的记忆和设置放在哪：%APPDATA%\PinyinIME（只有你能读写）。
+/// 环境变量 PINYIN_USER_DIR 可以改（测试用）。Mac / Linux 上是 ~/.pinyin-ime-engine/PinyinIME。
+pub fn user_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("PINYIN_USER_DIR") {
+        return PathBuf::from(p);
+    }
+    #[cfg(windows)]
+    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
+    #[cfg(not(windows))]
+    let base = std::env::var("HOME").map(|h| format!("{h}/.pinyin-ime-engine")).unwrap_or_else(|_| ".".into());
+    PathBuf::from(base).join("PinyinIME")
+}
+
+pub fn settings_path() -> PathBuf {
+    user_dir().join("settings.ini")
+}
 
 /// 设置（存在 %APPDATA%\PinyinIME\settings.ini，一行一项：键=值）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

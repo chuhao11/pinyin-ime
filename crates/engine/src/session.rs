@@ -279,9 +279,12 @@ impl Engine {
         if self.english_mode {
             return Response::pass();
         }
+        // Ctrl/Alt 组合键（复制、保存、切窗口……）一律交给程序。
+        // 正在打拼音时先把打的字母原样上屏，免得快捷键作用在半截的输入上
         if mods.ctrl || mods.alt {
+            let commit = if s.is_composing() { self.commit_raw(s).commit } else { None };
             s.clear_context();
-            return Response::pass();
+            return Response { consumed: false, commit };
         }
         if !s.is_composing() {
             if let Key::Char(c) = key {
@@ -1063,6 +1066,11 @@ mod tests {
         assert_eq!(m.process_key(Key::Char('A'), caps), Response::pass());
         let ctrl = Mods { ctrl: true, ..Mods::default() };
         assert_eq!(m.process_key(Key::Char('c'), ctrl), Response::pass());
+        // 打到一半按快捷键：字母原样上屏，快捷键照样交给程序
+        typ(&mut m, "nihao");
+        assert!(!m.would_consume(Key::Char('s'), ctrl));
+        assert_eq!(m.process_key(Key::Char('s'), ctrl), Response { consumed: false, commit: Some("nihao".into()) });
+        assert!(!m.is_composing());
     }
 
     #[test]

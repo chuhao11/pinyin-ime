@@ -271,12 +271,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "pinyin-settings"
+version = "0.1.0"
+dependencies = [
+ "pinyin-ipc",
+ "pinyin-types",
+ "pinyin-winpipe",
+ "windows",
+ "windows-numerics",
+]
+
+[[package]]
 name = "pinyin-tsf"
 version = "0.1.0"
 dependencies = [
  "pinyin-ipc",
  "pinyin-types",
+ "pinyin-winpipe",
  "windows",
+ "windows-core",
+ "windows-numerics",
 ]
 
 [[package]]
