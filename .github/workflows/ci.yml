@@ -149,13 +149,16 @@ jobs:
 
       - name: 试装、检查、再卸载（在 CI 的虚拟机里）
         if: runner.os == 'Windows'
+        timeout-minutes: 15
         shell: pwsh
         run: |
           $clsid = "{4D576843-6F05-43DC-B08F-FC06AE6D83F7}"
           $tip = "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$clsid"
           $app = "$env:ProgramFiles\PinyinIME"
           $setup = Get-ChildItem dist\PinyinIME-Setup-*.exe | Select-Object -First 1
-          $r = Start-Process $setup.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=dist\install.log" -Wait -PassThru
+          # 只等安装程序本身（-Wait 会连它启动的引擎一起等，引擎常驻就永远等不完）
+          $r = Start-Process $setup.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=dist\install.log" -PassThru
+          if (-not $r.WaitForExit(600000)) { throw "安装超过 10 分钟" }
           if ($r.ExitCode -ne 0) { Get-Content dist\install.log; throw "安装失败（$($r.ExitCode)）" }
           foreach ($f in "pinyin-engine.exe", "pinyin-settings.exe", "pinyin-tsf64.dll", "pinyin-tsf32.dll", "pinyin.ico", "pinyin.png", "data\pinyin.dict", "data\english.tsv", "data\pinyin.lm", "data\pinyin-formal.lm") {
             if (-not (Test-Path "$app\$f")) { throw "缺少 $f" }
@@ -170,7 +173,8 @@ jobs:
           Get-Content "$env:APPDATA\PinyinIME\engine.log" -ErrorAction SilentlyContinue
           Get-Process pinyin-engine | Format-Table Id, WorkingSet64, PrivateMemorySize64 | Out-Host
 
-          $r = Start-Process "$app\unins000.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait -PassThru
+          $r = Start-Process "$app\unins000.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -PassThru
+          $r.WaitForExit(300000) | Out-Null
           for ($i = 0; $i -lt 60 -and (Test-Path "$app\unins000.exe"); $i++) { Start-Sleep 1 }
           if (Test-Path "$tip\LanguageProfile\0x00000804") { throw "卸载后输入法还在" }
           if (Get-Process pinyin-engine -ErrorAction SilentlyContinue) { throw "卸载后引擎还在运行" }
