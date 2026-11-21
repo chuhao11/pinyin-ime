@@ -770,3 +770,53 @@ fn added_words_come_second_then_learn_normally() {
     assert_eq!(r.added, 0);
     esc(&mut ime);
 }
+
+#[test]
+fn backtick_twice_deletes_a_word() {
+    // 不想要的词：高亮它，按两下 `，再也不出现（全拼、简拼都不出）；按一下之后按别的键是取消
+    let Some(mut ime) = common::real_ime(UserDb::in_memory()) else { return };
+    let key = |ime: &mut Ime, k: Key| ime.process_key(k, Mods::default());
+    let to = |ime: &mut Ime, want: &str| {
+        let i = ime.view().items.iter().position(|t| t == want).unwrap_or_else(|| panic!("候选条里没有 {want}"));
+        while ime.view().highlight > i {
+            key(ime, Key::Left);
+        }
+        while ime.view().highlight < i {
+            key(ime, Key::Right);
+        }
+    };
+    typ(&mut ime, "kanpan");
+    to(&mut ime, "坎潘");
+    key(&mut ime, Key::Char('`'));
+    assert!(ime.view().armed, "按一下：标出来");
+    assert!(rank_of(&ime, "坎潘").is_some(), "按一下还不删");
+    // 按别的键：取消
+    key(&mut ime, Key::Left);
+    assert!(!ime.view().armed);
+    to(&mut ime, "坎潘");
+    key(&mut ime, Key::Char('`'));
+    let r = key(&mut ime, Key::Char('`'));
+    assert!(r.consumed && r.commit.is_none(), "删词不上屏");
+    assert!(rank_of(&ime, "坎潘").is_none(), "按两下：删掉");
+    assert!(ime.is_composing(), "拼音还在，可以接着选");
+    assert_eq!(ime.view().items[0], "看盘");
+    esc(&mut ime);
+    // 以后全拼、简拼都不出
+    for py in ["kanpan", "kp", "kanp"] {
+        typ(&mut ime, py);
+        assert!(rank_of(&ime, "坎潘").is_none(), "{py} 还有 坎潘");
+        esc(&mut ime);
+    }
+    // 单字不能删（免得手滑删了"的"）
+    typ(&mut ime, "de");
+    key(&mut ime, Key::Char('`'));
+    key(&mut ime, Key::Char('`'));
+    assert_eq!(ime.view().items[0], "的");
+    assert!(!ime.view().armed);
+    esc(&mut ime);
+    // 删错了：在设置页"添加词语"加回来
+    assert_eq!(ime.add_words("坎潘").added, 1);
+    typ(&mut ime, "kanpan");
+    assert!(rank_of(&ime, "坎潘").is_some(), "加回来以后又能打出来");
+    esc(&mut ime);
+}

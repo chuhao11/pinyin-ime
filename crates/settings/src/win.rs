@@ -8,6 +8,9 @@
 //! │ │ 关：, . ? ! 全部用英文标点              │ │
 //! │ └───────────────────────────────────────┘ │
 //! │ ┌───────────────────────────────────────┐ │
+//! │ │ 小技巧（单按 Shift、- 矩阵、按两下 ` 删词…） │ │
+//! │ └───────────────────────────────────────┘ │
+//! │ ┌───────────────────────────────────────┐ │
 //! │ │ 添加词语                                │ │
 //! │ │ 用逗号、空格或换行隔开；多音字写成…     │ │
 //! │ │ ┌───────────────────────────────────┐ │ │
@@ -86,16 +89,27 @@ const MAX_INPUT: usize = 8000;
 
 /// 窗口内容大小（DIP）
 const W: f32 = 460.0;
-const H: f32 = 508.0;
+const H: f32 = 614.0;
 
 /// 第一张卡片：中文标点
-const CARD_P: D2D_RECT_F = D2D_RECT_F { left: 16.0, top: 96.0, right: W - 16.0, bottom: 176.0 };
-/// 第二张卡片：添加词语
-const CARD_A: D2D_RECT_F = D2D_RECT_F { left: 16.0, top: 188.0, right: W - 16.0, bottom: 462.0 };
+const CARD_P: D2D_RECT_F = D2D_RECT_F { left: 16.0, top: 96.0, right: W - 16.0, bottom: 168.0 };
+/// 第二张卡片：小技巧
+const CARD_T: D2D_RECT_F = D2D_RECT_F { left: 16.0, top: 180.0, right: W - 16.0, bottom: 344.0 };
+/// 第三张卡片：添加词语
+const CARD_A: D2D_RECT_F = D2D_RECT_F { left: 16.0, top: 356.0, right: W - 16.0, bottom: 576.0 };
 /// 输入框的底（圆角框），真正的输入框在里面留 8 的边
-const FIELD: D2D_RECT_F = D2D_RECT_F { left: 32.0, top: 256.0, right: W - 32.0, bottom: 396.0 };
-const BUTTON: D2D_RECT_F = D2D_RECT_F { left: W - 32.0 - 88.0, top: 410.0, right: W - 32.0, bottom: 444.0 };
-const STATUS: D2D_RECT_F = D2D_RECT_F { left: 34.0, top: 404.0, right: W - 32.0 - 88.0 - 12.0, bottom: 450.0 };
+const FIELD: D2D_RECT_F = D2D_RECT_F { left: 32.0, top: 420.0, right: W - 32.0, bottom: 516.0 };
+const BUTTON: D2D_RECT_F = D2D_RECT_F { left: W - 32.0 - 88.0, top: 528.0, right: W - 32.0, bottom: 560.0 };
+const STATUS: D2D_RECT_F = D2D_RECT_F { left: 34.0, top: 522.0, right: W - 32.0 - 88.0 - 12.0, bottom: 566.0 };
+/// 小技巧：这个输入法和别的输入法不一样的地方
+const TIPS: [&str; 6] = [
+    "单按 Shift：中文 ↔ 纯英文（光标旁边闪一下 中 / 英）",
+    "打字时按 -：打开 5×5 候选，方向键挑，数字键选",
+    "回车：把打的字母原样上屏；Esc：清空",
+    "不想要的词：方向键选中，按两下 `（1 左边的键）删掉",
+    "删错了：在下面“添加词语”里加回来就恢复了",
+    "候选后面带 ~ 的：是按打错纠正出来的",
+];
 const SW_W: f32 = 50.0;
 const SW_H: f32 = 28.0;
 
@@ -477,13 +491,13 @@ impl App {
 
             // 中文标点
             rt.FillRoundedRectangle(&round(CARD_P, 10.0), &card);
-            self.text(&rt, "中文标点", &self.fonts.label, rect(34.0, CARD_P.top + 14.0, W, CARD_P.top + 40.0), &text);
+            self.text(&rt, "中文标点", &self.fonts.label, rect(34.0, CARD_P.top + 12.0, W, CARD_P.top + 36.0), &text);
             let desc = if self.settings.chinese_punct {
                 "开：，。？！：；全部用中文标点"
             } else {
                 "关：, . ? ! : ; 全部用英文标点"
             };
-            self.text(&rt, desc, &self.fonts.desc, rect(34.0, CARD_P.top + 42.0, W, CARD_P.top + 64.0), &dim);
+            self.text(&rt, desc, &self.fonts.desc, rect(34.0, CARD_P.top + 38.0, W, CARD_P.top + 60.0), &dim);
             let sw = switch_rect();
             let on = self.settings.chinese_punct;
             rt.FillRoundedRectangle(&round(sw, SW_H / 2.0), if on { &accent } else { &track });
@@ -499,14 +513,22 @@ impl App {
                 rt.DrawRoundedRectangle(&round(inset(sw, -3.0), SW_H / 2.0 + 3.0), &accent, 1.5, None);
             }
 
+            // 小技巧
+            rt.FillRoundedRectangle(&round(CARD_T, 10.0), &card);
+            self.text(&rt, "小技巧", &self.fonts.label, rect(34.0, CARD_T.top + 12.0, W, CARD_T.top + 36.0), &text);
+            for (i, t) in TIPS.iter().enumerate() {
+                let y = CARD_T.top + 40.0 + i as f32 * 19.0;
+                self.text(&rt, t, &self.fonts.desc, rect(34.0, y, W - 20.0, y + 19.0), &text);
+            }
+
             // 添加词语
             rt.FillRoundedRectangle(&round(CARD_A, 10.0), &card);
-            self.text(&rt, "添加词语", &self.fonts.label, rect(34.0, CARD_A.top + 14.0, W, CARD_A.top + 40.0), &text);
+            self.text(&rt, "添加词语", &self.fonts.label, rect(34.0, CARD_A.top + 12.0, W, CARD_A.top + 36.0), &text);
             self.text(
                 &rt,
                 "用逗号、空格或换行隔开；多音字可以写成 银行(yin hang)",
                 &self.fonts.desc,
-                rect(34.0, CARD_A.top + 42.0, W - 20.0, CARD_A.top + 62.0),
+                rect(34.0, CARD_A.top + 38.0, W - 20.0, CARD_A.top + 58.0),
                 &dim,
             );
             rt.FillRoundedRectangle(&round(FIELD, 8.0), &field);

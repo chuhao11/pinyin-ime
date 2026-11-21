@@ -285,7 +285,7 @@ fn draw(ime: &Ime, typed: &str, user_path: &Path, ms: f64) -> std::io::Result<()
     put_line(
         &mut o,
         &mut line,
-        "数字选字 · 空格上屏 · - 打开/收起 5×5 矩阵 · 方向键移动 · 回车上屏字母 · Esc 清空 · ~ 表示打错纠正",
+        "数字选字 · 空格上屏 · - 打开/收起 5×5 矩阵 · 方向键移动 · 回车上屏字母 · Esc 清空 · ~ 表示打错纠正 · 按两下 ` 删掉高亮的词",
     )?;
     put_line(&mut o, &mut line, "")?;
     put_line(&mut o, &mut line, "打出的文字：")?;
@@ -296,6 +296,10 @@ fn draw(ime: &Ime, typed: &str, user_path: &Path, ms: f64) -> std::io::Result<()
     let v = ime.view();
     if v.composing {
         put_line(&mut o, &mut line, &format!("输入：{}", v.preedit))?;
+        if v.armed {
+            let w = v.items.get(v.highlight).cloned().unwrap_or_default();
+            put_line(&mut o, &mut line, &format!("再按一次 ` 删除「{w}」，按别的键取消"))?;
+        }
         match v.mode {
             Mode::Row => {
                 queue!(o, cursor::MoveTo(0, line), Print("候选："))?;

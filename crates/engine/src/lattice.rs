@@ -1035,6 +1035,8 @@ pub fn analyze_with(q: &Query, input: &str) -> Vec<Candidate> {
             }
         }
     }
+    // 你删掉的词（按两下 `）：整句、组合也不出（"坎潘"不是词库里的词，是单字拼出来的）
+    out.retain(|c| c.code.is_empty() || !user.is_blocked(&c.code, &c.text));
     // 你在设置页加入、还没用过的词：用全拼打时排第二个（用过以后和别的词一样靠记忆排序）
     let added = out.iter().position(|c| {
         c.kind == CandKind::Word

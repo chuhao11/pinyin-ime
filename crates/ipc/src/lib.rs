@@ -14,7 +14,8 @@ use pinyin_types::{Key, Mode, Mods, View};
 pub use pinyin_types;
 
 /// 协议版本：两边不一致时 DLL 不用引擎（原样放过按键），不会出怪事。
-pub const PROTO: u32 = 1;
+/// 2：候选窗多了"按了一下 `，再按就删"的标记
+pub const PROTO: u32 = 2;
 /// 一条消息最长多少字节。
 pub const MAX_FRAME: usize = 256 * 1024;
 const MAX_STR: usize = 16 * 1024;
@@ -140,6 +141,7 @@ impl Enc {
         self.u32(v.pages as u32);
         self.u32(v.total as u32);
         self.bool(v.english_mode);
+        self.bool(v.armed);
     }
 }
 
@@ -234,10 +236,11 @@ impl<'a> Dec<'a> {
         let pages = self.u32()? as usize;
         let total = self.u32()? as usize;
         let english_mode = self.bool()?;
+        let armed = self.bool()?;
         if n > 0 && highlight >= n {
             return Err(DecodeError("高亮位置不对"));
         }
-        Ok(View { composing, preedit, mode, items, highlight, page, pages, total, corrected, english_mode })
+        Ok(View { composing, preedit, mode, items, highlight, page, pages, total, corrected, english_mode, armed })
     }
     fn done(&self) -> Result<(), DecodeError> {
         if self.p == self.b.len() {
@@ -511,6 +514,7 @@ mod tests {
             total: 2,
             corrected: vec![false, true],
             english_mode: false,
+            armed: true,
         };
         for r in [
             Reply::Hello { proto: 1 },

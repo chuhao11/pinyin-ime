@@ -10,13 +10,13 @@ use pinyin_types::{Mode, View};
 use windows::core::{w, Result, HSTRING};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
+    D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_GRADIENT_STOP, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush, D2D1_DRAW_TEXT_OPTIONS_NONE,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_HWND_RENDER_TARGET_PROPERTIES,
-    D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-    D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
+    D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_GAMMA_2_2,
+    D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
+    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED,
@@ -50,6 +50,16 @@ const IPAD_Y: f32 = 4.0;
 const LABEL_GAP: f32 = 4.0;
 const RADIUS: f32 = 6.0;
 const GRID_COLS: usize = 5;
+/// 按了一下 ` 的词用的彩虹色：红 橙 黄 绿 蓝 靛 紫
+const RAINBOW: [(u8, u8, u8); 7] = [
+    (0xFF, 0x5A, 0x4E),
+    (0xFF, 0xA0, 0x3A),
+    (0xFF, 0xD6, 0x3A),
+    (0x5E, 0xD1, 0x6A),
+    (0x4A, 0xA8, 0xFF),
+    (0x7A, 0x78, 0xF0),
+    (0xC7, 0x7D, 0xF0),
+];
 const FLASH_TIMER: usize = 1;
 const FLASH_MS: u32 = 700;
 
@@ -246,6 +256,7 @@ fn create() -> Result<Cand> {
                 total: 0,
                 corrected: Vec::new(),
                 english_mode: false,
+                armed: false,
             },
             dark: false,
             size: (10.0, 10.0),
@@ -280,9 +291,13 @@ impl Cand {
             return Ok(());
         }
         let v = self.view.clone();
-        let header = match v.mode {
-            Mode::Row => v.preedit.clone(),
-            Mode::Grid => format!("{}    第 {}/{} 批", v.preedit, v.page + 1, v.pages.max(1)),
+        let header = match (v.armed, v.mode) {
+            // 按了一下 `：提示再按一次就删
+            (true, _) => {
+                format!("再按一次 ` 删除「{}」，按别的键取消", v.items.get(v.highlight).cloned().unwrap_or_default())
+            }
+            (false, Mode::Row) => v.preedit.clone(),
+            (false, Mode::Grid) => format!("{}    第 {}/{} 批", v.preedit, v.page + 1, v.pages.max(1)),
         };
         let (pre, pw, ph) = self.layout(&header, true)?;
         self.pre = Some(pre);
@@ -391,6 +406,8 @@ impl Cand {
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                 );
             }
+            let armed = self.view.armed && self.flash.is_none();
+            let dark_b = brush(rgb(0x14, 0x14, 0x14))?;
             for c in &self.cells {
                 if c.highlight {
                     let rr = D2D1_ROUNDED_RECT {
@@ -398,9 +415,33 @@ impl Cand {
                         radiusX: RADIUS,
                         radiusY: RADIUS,
                     };
-                    rt.FillRoundedRectangle(&rr, &acc_b);
+                    if armed {
+                        // 按了一下 `：这个词变成彩虹色，再按一下就删
+                        let stops: Vec<D2D1_GRADIENT_STOP> = RAINBOW
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &(r, g, b))| D2D1_GRADIENT_STOP {
+                                position: i as f32 / (RAINBOW.len() - 1) as f32,
+                                color: rgb(r, g, b),
+                            })
+                            .collect();
+                        let coll = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)?;
+                        let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                            startPoint: windows_numerics::Vector2 { X: c.x, Y: c.y },
+                            endPoint: windows_numerics::Vector2 { X: c.x + c.w, Y: c.y + c.h },
+                        };
+                        let rainbow = rt.CreateLinearGradientBrush(&props, None, &coll)?;
+                        rt.FillRoundedRectangle(&rr, &rainbow);
+                    } else {
+                        rt.FillRoundedRectangle(&rr, &acc_b);
+                    }
                 }
-                let (lb, tb) = if c.highlight { (&on_b, &on_b) } else { (&dim_b, &text_b) };
+                let (lb, tb) = match (c.highlight, armed) {
+                    // 彩虹底上用深色字，黄色、绿色那段也看得清
+                    (true, true) => (&dark_b, &dark_b),
+                    (true, false) => (&on_b, &on_b),
+                    _ => (&dim_b, &text_b),
+                };
                 if let Some(l) = &c.label {
                     // 数字比候选字小，和字的中线对齐
                     rt.DrawTextLayout(

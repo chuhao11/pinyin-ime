@@ -81,6 +81,8 @@ pub struct View {
     pub corrected: Vec<bool>,
     /// 现在是纯英文输入
     pub english_mode: bool,
+    /// 高亮的那个词已经按了一下 `：再按一下就删掉它（候选窗里这个词变成彩虹色）
+    pub armed: bool,
 }
 
 #[cfg(test)]

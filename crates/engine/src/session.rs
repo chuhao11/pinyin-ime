@@ -87,6 +87,8 @@ pub struct Session {
     /// 中文引号是不是正开着（下一个是右引号）
     dq_open: bool,
     sq_open: bool,
+    /// 按了一下 ` 的词：再按一下就删掉它
+    armed: Option<String>,
 }
 
 impl Session {
@@ -117,6 +119,7 @@ impl Session {
         self.row_len = 0;
         self.hl = 0;
         self.mode = Mode::Row;
+        self.armed = None;
     }
 
     fn remaining(&self) -> &str {
@@ -344,10 +347,47 @@ impl Engine {
                 if digit { self.lm.as_ref().and_then(|l| l.id(NUM_TOKEN)).map(|id| (id, self.now())) } else { None };
             return Response::pass();
         }
+        // 删词：高亮一个词，按两下 `（数字 1 左边的键）。按了一下之后按别的键就取消
+        if key == Key::Char('`') {
+            return self.delete_key(s);
+        }
+        s.armed = None;
         match s.mode {
             Mode::Row => self.key_row(s, key),
             Mode::Grid => self.key_grid(s, key),
         }
+    }
+
+    /// 按 `：第一下把高亮的词标出来（候选窗里变成彩虹色），第二下删掉它，以后这个读音再也不出这个词。
+    /// 只能删两个字以上的词（包括单字拼出来的组合，比如"坎潘"）；单字、英文不删，免得手滑删了"的"。
+    /// 删错了：在设置页"添加词语"里加回来就恢复了。
+    fn delete_key(&mut self, s: &mut Session) -> Response {
+        let Some(c) = s.cands.get(s.hl).cloned() else { return Response::eaten() };
+        let deletable =
+            matches!(c.kind, CandKind::Word | CandKind::Sentence) && !c.code.is_empty() && c.text.chars().count() >= 2;
+        if !deletable {
+            s.armed = None;
+            return Response::eaten();
+        }
+        if s.armed.as_deref() != Some(c.text.as_str()) {
+            s.armed = Some(c.text);
+            return Response::eaten();
+        }
+        s.armed = None;
+        self.user.forget(&self.dict, &c.code, &c.text);
+        // 候选马上刷新；拼音还在，高亮留在原来的位置附近（可以接着删）
+        let (mode, hl) = (s.mode, s.hl);
+        self.refresh(s);
+        if !s.cands.is_empty() {
+            match mode {
+                Mode::Grid => {
+                    s.mode = Mode::Grid;
+                    s.hl = hl.min(s.cands.len() - 1);
+                }
+                Mode::Row => s.hl = hl.min(s.row_len.saturating_sub(1)),
+            }
+        }
+        Response::eaten()
     }
 
     fn key_row(&mut self, s: &mut Session, key: Key) -> Response {
@@ -734,6 +774,7 @@ impl Engine {
             total,
             corrected: shown.iter().map(|c| c.corrected()).collect(),
             english_mode: self.english_mode,
+            armed: s.armed.as_ref().is_some_and(|t| s.cands.get(s.hl).is_some_and(|c| &c.text == t)),
         }
     }
 }
