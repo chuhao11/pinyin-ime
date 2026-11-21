@@ -14,13 +14,13 @@ pub struct Service {
     data_dir: PathBuf,
     settings_path: PathBuf,
     settings: Settings,
-    /// 现在加载的是不是书面模型（None 表示还没加载）
-    loaded_formal: Option<bool>,
+    /// 语言模型加载了没有
+    lm_loaded: bool,
 }
 
 impl Service {
     pub fn new(engine: Engine, data_dir: PathBuf, settings_path: PathBuf) -> Service {
-        let mut s = Service { engine, data_dir, settings_path, settings: Settings::default(), loaded_formal: None };
+        let mut s = Service { engine, data_dir, settings_path, settings: Settings::default(), lm_loaded: false };
         s.reload_settings();
         s
     }
@@ -29,17 +29,33 @@ impl Service {
         self.settings
     }
 
-    /// 重新读设置：换语言模型（日常/书面）、开关中文标点。
+    /// 等着加入的词（设置页在引擎没运行时写的）。
+    pub fn pending_words_path(&self) -> std::path::PathBuf {
+        self.settings_path.with_file_name(pinyin_ipc::PENDING_WORDS)
+    }
+
+    fn import_pending_words(&mut self) {
+        let p = self.pending_words_path();
+        if let Ok(text) = std::fs::read_to_string(&p) {
+            let _ = std::fs::remove_file(&p);
+            if !text.trim().is_empty() {
+                self.engine.add_words(&text);
+            }
+        }
+    }
+
+    /// 重新读设置（开关中文标点）；语言模型第一次时加载。
     pub fn reload_settings(&mut self) {
         self.settings = Settings::load(&self.settings_path);
         self.engine.config.chinese_punct = self.settings.chinese_punct;
-        if self.loaded_formal != Some(self.settings.formal) {
-            let name = if self.settings.formal { "pinyin-formal.lm" } else { "pinyin.lm" };
-            if let Ok(lm) = Lm::open(&self.data_dir.join(name)) {
+        if !self.lm_loaded {
+            if let Ok(lm) = Lm::open(&self.data_dir.join("pinyin.lm")) {
                 self.engine.set_lm(lm);
-                self.loaded_formal = Some(self.settings.formal);
+                self.lm_loaded = true;
             }
         }
+        // 设置页在引擎没运行时加入的词，存在这个文件里，等引擎读进来
+        self.import_pending_words();
     }
 
     pub fn handle(&mut self, s: &mut Session, req: Request) -> Reply {
@@ -58,11 +74,13 @@ impl Service {
                 s.clear_context();
                 Reply::Ok
             }
-            Request::GetState => Reply::State {
-                english_mode: self.engine.english_mode(),
-                chinese_punct: self.settings.chinese_punct,
-                formal: self.settings.formal,
-            },
+            Request::GetState => {
+                Reply::State { english_mode: self.engine.english_mode(), chinese_punct: self.settings.chinese_punct }
+            }
+            Request::AddWords { text } => {
+                let r = self.engine.add_words(&text);
+                Reply::WordsAdded { added: r.added as u32, skipped: r.skipped }
+            }
             Request::ReloadSettings => {
                 self.reload_settings();
                 Reply::Ok
@@ -110,7 +128,7 @@ mod tests {
         }
         assert_eq!(commit, "你好");
         // 设置：打开中文标点
-        Settings { formal: false, chinese_punct: true }.save(&dir.join("settings.ini")).unwrap();
+        Settings { chinese_punct: true }.save(&dir.join("settings.ini")).unwrap();
         assert_eq!(svc.handle(&mut s, Request::ReloadSettings), Reply::Ok);
         match svc.handle(&mut s, Request::Key { key: Key::Char(','), mods: Mods::default() }) {
             Reply::KeyResult { commit, .. } => assert_eq!(commit.as_deref(), Some("，")),

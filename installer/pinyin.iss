@@ -2,7 +2,7 @@
 ;   iscc installer\pinyin.iss
 ; 需要先把文件放到 dist\stage（CI 里"整理安装文件"那一步做的事）：
 ;   pinyin-engine.exe  pinyin-settings.exe  pinyin-tsf64.dll  pinyin-tsf32.dll  pinyin.ico  pinyin.png
-;   data\pinyin.dict  data\english.tsv  data\pinyin.lm  data\pinyin-formal.lm
+;   data\pinyin.dict  data\english.tsv  data\pinyin.lm
 ;
 ; 安装做的事：
 ;   1. 复制文件到 C:\Program Files\PinyinIME
@@ -58,8 +58,8 @@ Source: "..\dist\stage\data\*";              DestDir: "{app}\data"; Flags: ignor
 Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "PinyinIME"; ValueData: """{app}\pinyin-engine.exe"""; Flags: uninsdeletevalue
 
 [Icons]
-Name: "{autodesktop}\拼音输入法设置";  Filename: "{app}\pinyin-settings.exe"; IconFilename: "{app}\pinyin.ico"; Comment: "文风、中文标点"
-Name: "{autoprograms}\拼音输入法设置"; Filename: "{app}\pinyin-settings.exe"; IconFilename: "{app}\pinyin.ico"; Comment: "文风、中文标点"
+Name: "{autodesktop}\拼音输入法设置";  Filename: "{app}\pinyin-settings.exe"; IconFilename: "{app}\pinyin.ico"; Comment: "中文标点、添加词语"
+Name: "{autoprograms}\拼音输入法设置"; Filename: "{app}\pinyin-settings.exe"; IconFilename: "{app}\pinyin.ico"; Comment: "中文标点、添加词语"
 
 [Run]
 ; 以你本人的身份（不是管理员身份）运行：输入法列表是每个人自己的，引擎也必须是普通权限

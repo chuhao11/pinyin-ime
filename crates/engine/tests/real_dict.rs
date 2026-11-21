@@ -514,3 +514,259 @@ fn char_picked_dozens_of_times_comes_first() {
     assert!(checked > 300, "只查了 {checked} 个音节");
     assert!(bad.is_empty(), "{} 个音节选几十次也换不过来：\n{}", bad.len(), bad.join("\n"));
 }
+
+/// 常用的双字词（词库分数最高的若干个），给下面的整类测试用：(全拼, 词, 音节)
+fn common_two_char_words_syl(limit: usize) -> Vec<(String, String, Vec<String>)> {
+    let Some(d) = common::real_dict() else { return Vec::new() };
+    let mut v: Vec<(f32, String, String, Vec<String>)> = Vec::new();
+    d.for_each_word(|code, w| {
+        let t = d.word_text(w);
+        if code.len() == 2 && t.chars().count() == 2 {
+            let syl: Vec<String> = code.iter().map(|&c| d.syllable(c).to_string()).collect();
+            v.push((d.word_score(w), syl.concat(), t.to_string(), syl));
+        }
+    });
+    v.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut seen = std::collections::HashSet::new();
+    v.into_iter().filter(|x| seen.insert(x.1.clone())).take(limit).map(|x| (x.1, x.2, x.3)).collect()
+}
+
+fn common_two_char_words(limit: usize) -> Vec<(String, String)> {
+    common_two_char_words_syl(limit).into_iter().map(|x| (x.0, x.1)).collect()
+}
+
+#[test]
+fn real_word_beats_combination_of_single_chars() {
+    // 打常用双字词的全拼，第一个不能是两个单字拼出来的组合（kanpan 不能是"坎潘"，zhangting 不能是"张廷"）
+    let Some(mut ime) = common::real_ime(UserDb::in_memory()) else { return };
+    let mut bad = Vec::new();
+    let words = common_two_char_words(2000);
+    assert!(words.len() > 1000);
+    for (py, _) in &words {
+        fresh(&mut ime);
+        typ(&mut ime, py);
+        if let Some(c) = ime.candidates().first() {
+            if c.kind == pinyin_engine::CandKind::Sentence && c.text.chars().count() == 2 {
+                bad.push(format!("{py}: {}", ime.view().items.join(" ")));
+            }
+        }
+    }
+    esc(&mut ime);
+    assert!(bad.is_empty(), "{} 个：\n{}", bad.len(), bad.join("\n"));
+}
+
+/// 常见的"前一个词"
+const PREVS: [(&str, &str); 14] = [
+    ("wo", "我"),
+    ("ni", "你"),
+    ("yao", "要"),
+    ("shi", "是"),
+    ("de", "的"),
+    ("le", "了"),
+    ("ta", "他"),
+    ("zai", "在"),
+    ("xiang", "想"),
+    ("gei", "给"),
+    ("hao", "好"),
+    ("ba", "吧"),
+    ("qu", "去"),
+    ("kan", "看"),
+];
+
+#[test]
+fn context_only_nudges() {
+    // 上文只能微调：有上文时排第一的，必须本来就在前 15 个（大约两排候选条）里——
+    // 好+烦、你+疯 这种前后关联可以把稍后面的提上来，但不相干的字词不能从很后面突然跳到第一
+    let Some(mut ime) = common::real_ime(UserDb::in_memory()) else { return };
+    let mut inputs: Vec<String> = all_syllables();
+    inputs.extend(common_two_char_words(300).into_iter().map(|x| x.0));
+    inputs.extend(["l", "d", "zuoyige", "zheye", "quanzhong", "kanpan", "made", "xijie"].map(String::from));
+    let mut bad = Vec::new();
+    let mut checked = 0;
+    for inp in &inputs {
+        fresh(&mut ime);
+        typ(&mut ime, inp);
+        let top3: Vec<String> = ime.candidates().iter().take(15).map(|c| c.text.clone()).collect();
+        if top3.is_empty() {
+            continue;
+        }
+        for (py, w) in PREVS {
+            fresh(&mut ime);
+            typ(&mut ime, py);
+            pick(&mut ime, w);
+            typ(&mut ime, inp);
+            let first = ime.view().items.first().cloned().unwrap_or_default();
+            checked += 1;
+            if !top3.contains(&first) {
+                bad.push(format!("{w} + {inp}: {first}（没有上文时前 15 个：{}）", top3.join(" ")));
+            }
+        }
+    }
+    esc(&mut ime);
+    let rate = bad.len() as f64 / checked as f64;
+    eprintln!("上文稳定：查了 {checked} 次，{} 次超出前 15", bad.len());
+    assert!(
+        rate < 0.001,
+        "{} / {checked} 次：\n{}",
+        bad.len(),
+        bad.iter().take(60).cloned().collect::<Vec<_>>().join("\n")
+    );
+}
+
+#[test]
+fn picking_the_exact_spelling_beats_a_correction() {
+    // 常用词按错一个旁边的键，按错后恰好还是能用的拼音（zhege 打成 zheye）：
+    // 纠错的（这个）排第一时你选了原样拼写的（这也），下次原样拼写的排第一（顺位能被替换）
+    let Some(d) = common::real_dict() else { return };
+    let Some(mut ime) = common::real_ime(UserDb::in_memory()) else { return };
+    const ROWS: [&str; 3] = ["qwertyuiop", "asdfghjkl", "zxcvbnm"];
+    let neighbors = |c: char| -> Vec<char> {
+        for row in ROWS {
+            if let Some(i) = row.find(c) {
+                let b = row.as_bytes();
+                return [i.checked_sub(1), Some(i + 1)]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|j| b.get(j).map(|&x| x as char))
+                    .collect();
+            }
+        }
+        Vec::new()
+    };
+    let parses = |py: &str| -> bool {
+        // 能整个切成完整音节
+        let n = py.len();
+        let mut ok = vec![false; n + 1];
+        ok[0] = true;
+        for i in 0..n {
+            if ok[i] {
+                for l in 1..=6.min(n - i) {
+                    if d.syllable_id(&py[i..i + l]).is_some() {
+                        ok[i + l] = true;
+                    }
+                }
+            }
+        }
+        ok[n]
+    };
+    let mut checked = 0;
+    let mut bad = Vec::new();
+    for (py, _) in common_two_char_words(600) {
+        for (k, c) in py.char_indices() {
+            for nb in neighbors(c) {
+                let typed = format!("{}{}{}", &py[..k], nb, &py[k + 1..]);
+                if !parses(&typed) {
+                    continue;
+                }
+                fresh(&mut ime);
+                typ(&mut ime, &typed);
+                let cands = ime.candidates();
+                if cands.first().is_none_or(|c| !c.corrected()) {
+                    esc(&mut ime);
+                    continue;
+                }
+                let Some(exact) =
+                    cands.iter().find(|c| !c.corrected() && c.consumed == typed.len()).map(|c| c.text.clone())
+                else {
+                    esc(&mut ime);
+                    continue;
+                };
+                checked += 1;
+                pick(&mut ime, &exact);
+                fresh(&mut ime);
+                typ(&mut ime, &typed);
+                if ime.candidates().first().is_some_and(|c| c.corrected()) {
+                    bad.push(format!("{typed}: 选了 {exact}，第一个还是纠错的：{}", ime.view().items.join(" ")));
+                }
+            }
+        }
+    }
+    esc(&mut ime);
+    eprintln!("纠错让位：查了 {checked} 次");
+    assert!(checked > 20, "只查了 {checked} 次");
+    assert!(bad.is_empty(), "{} 个：\n{}", bad.len(), bad.join("\n"));
+}
+
+#[test]
+fn front_back_nasal_mixups_stay_visible() {
+    // 前后鼻音打混（禁止 打成 jingzhi）：常用词要在候选条里能看到，但不抢第一
+    let Some(d) = common::real_dict() else { return };
+    let Some(mut ime) = common::real_ime(UserDb::in_memory()) else { return };
+    let swap = |s: &str| -> Option<String> {
+        let alt = if let Some(x) = s.strip_suffix("ng") {
+            format!("{x}n")
+        } else if s.ends_with('n') {
+            format!("{s}g")
+        } else {
+            return None;
+        };
+        d.syllable_id(&alt).map(|_| alt)
+    };
+    let mut checked = 0;
+    let mut bad = Vec::new();
+    let mut stolen = Vec::new();
+    for (py, w, sy) in common_two_char_words_syl(400) {
+        // 把第一个能换的鼻音换掉
+        let Some(i) = sy.iter().position(|s| swap(s).is_some()) else { continue };
+        let mut typed = sy.clone();
+        typed[i] = swap(&sy[i]).unwrap();
+        let typed = typed.concat();
+        fresh(&mut ime);
+        typ(&mut ime, &typed);
+        checked += 1;
+        let row = ime.view().items;
+        let pos = row.iter().position(|t| *t == w);
+        if pos.is_none() && rank_of(&ime, &w).is_none_or(|r| r > 8) {
+            bad.push(format!("{w}（{py}）打成 {typed}：{}", row.join(" ")));
+        }
+        let exact_word = ime.candidates().iter().any(|c| {
+            c.kind == pinyin_engine::CandKind::Word
+                && c.exact
+                && !c.poor
+                && c.consumed == typed.len()
+                && c.text.chars().count() >= 2
+        });
+        if pos == Some(0) && ime.candidates()[0].corrected() && exact_word {
+            stolen.push(format!("{w}（{py}）打成 {typed}：第一个就是它，原样拼写的被抢了"));
+        }
+    }
+    esc(&mut ime);
+    eprintln!("前后鼻音：查了 {checked} 个");
+    assert!(checked > 100, "只查了 {checked} 个");
+    assert!(bad.len() * 20 <= checked, "{} / {checked} 个看不到：\n{}", bad.len(), bad.join("\n"));
+    assert!(stolen.is_empty(), "{}", stolen.join("\n"));
+}
+
+#[test]
+fn added_words_come_second_then_learn_normally() {
+    // 设置页加入的词：用全拼打排第二个；选几次以后排第一
+    let Some(mut ime) = common::real_ime(UserDb::in_memory()) else { return };
+    let r = ime.add_words("卷王，张子涵 螺蛳粉；abc 好(hao)\n曾经(zeng jing)");
+    assert_eq!(r.added, 4, "{r:?}");
+    assert_eq!(r.skipped.len(), 2, "{r:?}");
+    assert!(r.skipped.iter().any(|x| x.starts_with("abc")));
+    assert!(r.skipped.iter().any(|x| x.starts_with("好")));
+    for (py, w) in [("juanwang", "卷王"), ("zhangzihan", "张子涵"), ("luosifen", "螺蛳粉"), ("zengjing", "曾经")]
+    {
+        fresh(&mut ime);
+        typ(&mut ime, py);
+        let r = rank_of(&ime, w);
+        // 本来就是第一的（螺蛳粉、曾经）保持第一，其余的排第二
+        assert!(r.is_some_and(|r| r <= 2), "{py} → {w} 排第 {r:?}：{:?}", ime.view().items);
+    }
+    // 自己写了拼音的：按你写的拼音加（曾经 写成 zeng jing，打 zengjing 也能出来）
+    fresh(&mut ime);
+    typ(&mut ime, "zengjing");
+    assert!(rank_of(&ime, "曾经").is_some_and(|r| r <= 2), "{:?}", ime.view().items);
+    // 人名选一次就排第一
+    fresh(&mut ime);
+    typ(&mut ime, "zhangzihan");
+    pick(&mut ime, "张子涵");
+    fresh(&mut ime);
+    typ(&mut ime, "zhangzihan");
+    assert_eq!(ime.view().items[0], "张子涵");
+    // 再加一次：说已经加过了
+    let r = ime.add_words("卷王");
+    assert_eq!(r.added, 0);
+    esc(&mut ime);
+}

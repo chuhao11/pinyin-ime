@@ -93,7 +93,7 @@ fn type_through_the_real_engine_process() {
     assert_eq!(typ(&mut c2, " "), "我");
 
     // 设置页改了设置文件：两秒内生效
-    Settings { formal: false, chinese_punct: true }.save(&user.join("settings.ini")).unwrap();
+    Settings { chinese_punct: true }.save(&user.join("settings.ini")).unwrap();
     let start = Instant::now();
     loop {
         if typ(&mut c, "nihao,") == "你好，" {
@@ -108,7 +108,50 @@ fn type_through_the_real_engine_process() {
     assert!(matches!(Reply::decode(&r).unwrap(), Reply::Error(_)));
     assert_eq!(typ(&mut c, "shi "), "是");
 
+    // 设置页"添加词语"：加进去，用全拼打排第二个
+    match call(&mut c, &Request::AddWords { text: "卷王，abc".into() }).unwrap() {
+        Reply::WordsAdded { added, skipped } => {
+            assert_eq!(added, 1);
+            assert_eq!(skipped.len(), 1, "{skipped:?}");
+        }
+        r => panic!("{r:?}"),
+    }
+    let view = |c: &mut Conn, s: &str| -> Vec<String> {
+        let mut items = Vec::new();
+        for ch in s.chars() {
+            if let Ok(Reply::KeyResult { view, .. }) =
+                call(c, &Request::Key { key: Key::Char(ch), mods: Mods::default() })
+            {
+                items = view.items;
+            }
+        }
+        let _ = call(c, &Request::Key { key: Key::Escape, mods: Mods::default() });
+        items
+    };
+    let items = view(&mut c, "juanwang");
+    assert!(items.iter().take(2).any(|t| t == "卷王"), "{items:?}");
+
     // 记忆存在用户目录里
     assert!(user.join("user.db").exists());
+    drop(c);
+    drop(c2);
+    drop(_engine);
+
+    // 引擎没运行时设置页把词存进等待文件：引擎启动时加进去
+    std::fs::write(user.join(pinyin_ipc::PENDING_WORDS), "螺蛳粉卷\n").unwrap();
+    let sock2 = tmp.join("sock2");
+    let _engine2 = Engine(
+        Command::new(env!("CARGO_BIN_EXE_pinyin-engine"))
+            .env("PINYIN_DATA", &data)
+            .env("PINYIN_USER_DIR", &user)
+            .env("PINYIN_SOCKET", &sock2)
+            .spawn()
+            .unwrap(),
+    );
+    let mut c = connect(&sock2).expect("连不上引擎");
+    call(&mut c, &Request::Hello { proto: PROTO, pid: 1 }).unwrap();
+    let items = view(&mut c, "luosifenjuan");
+    assert!(items.iter().take(2).any(|t| t == "螺蛳粉卷"), "{items:?}");
+    assert!(!user.join(pinyin_ipc::PENDING_WORDS).exists(), "等待文件读完就删");
     let _ = std::fs::remove_dir_all(&tmp);
 }

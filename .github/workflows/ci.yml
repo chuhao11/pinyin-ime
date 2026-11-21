@@ -134,7 +134,7 @@ jobs:
           cp target/i686-pc-windows-msvc/release/pinyin_tsf.dll dist/stage/pinyin-tsf32.dll
           cp assets/icon/pinyin.ico dist/stage/
           cp assets/icon/pinyin-256.png dist/stage/pinyin.png
-          cp data/build/pinyin.dict data/build/english.tsv data/build/pinyin.lm data/build/pinyin-formal.lm dist/stage/data/
+          cp data/build/pinyin.dict data/build/english.tsv data/build/pinyin.lm dist/stage/data/
           ls -la dist/stage dist/stage/data
 
       - name: 生成安装程序
@@ -160,7 +160,7 @@ jobs:
           $r = Start-Process $setup.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=dist\install.log" -PassThru
           if (-not $r.WaitForExit(600000)) { throw "安装超过 10 分钟" }
           if ($r.ExitCode -ne 0) { Get-Content dist\install.log; throw "安装失败（$($r.ExitCode)）" }
-          foreach ($f in "pinyin-engine.exe", "pinyin-settings.exe", "pinyin-tsf64.dll", "pinyin-tsf32.dll", "pinyin.ico", "pinyin.png", "data\pinyin.dict", "data\english.tsv", "data\pinyin.lm", "data\pinyin-formal.lm") {
+          foreach ($f in "pinyin-engine.exe", "pinyin-settings.exe", "pinyin-tsf64.dll", "pinyin-tsf32.dll", "pinyin.ico", "pinyin.png", "data\pinyin.dict", "data\english.tsv", "data\pinyin.lm") {
             if (-not (Test-Path "$app\$f")) { throw "缺少 $f" }
           }
           if (-not (Test-Path "$tip\LanguageProfile\0x00000804")) { throw "输入法没注册" }

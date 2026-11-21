@@ -37,7 +37,7 @@ const EVAL_MAX_CHARS: usize = 12;
 const UNI_CORPUS_WEIGHT: f64 = 0.8;
 /// 语料里至少出现这么多次的词才进语言模型的词表（其余的用词库分数）。
 const MIN_UNI_COUNT: u64 = 2;
-/// 默认（"日常"模式）：对话语料的次数乘 3，维基乘 1。"书面"模式用 --chat-weight 1 --wiki-weight 3。
+/// 默认：对话语料的次数乘 3，维基乘 1（输入法只用这一个模型；排词时还会和词库频率各占一半）。
 const CHAT_WEIGHT: u32 = 3;
 const WIKI_WEIGHT: u32 = 1;
 

@@ -69,15 +69,10 @@ fn open_english() -> Option<EnglishDict> {
     EnglishDict::load(&p).ok()
 }
 
-/// 语言模型也在同一个文件夹：日常 pinyin.lm，书面 pinyin-formal.lm；没有就不用。
-fn open_lm_style(formal: bool) -> Option<Lm> {
-    let name = if formal { "pinyin-formal.lm" } else { "pinyin.lm" };
-    let p = find_dict().ok()?.with_file_name(name);
-    Lm::open(&p).ok()
-}
-
+/// 语言模型也在同一个文件夹（pinyin.lm）；没有就不用。
 fn open_lm() -> Option<Lm> {
-    open_lm_style(std::env::var("PINYIN_FORMAL").is_ok())
+    let p = find_dict().ok()?.with_file_name("pinyin.lm");
+    Lm::open(&p).ok()
 }
 
 fn new_ime(dict: Dict, user: UserDb) -> Ime {
@@ -237,9 +232,8 @@ fn interactive() -> Result<(), String> {
     let _guard = TermGuard;
     execute!(stdout(), terminal::EnterAlternateScreen, cursor::Hide).map_err(|e| e.to_string())?;
     let mut last_ms = 0.0;
-    let mut formal = std::env::var("PINYIN_FORMAL").is_ok();
     loop {
-        draw(&ime, &typed, &up, last_ms, formal).map_err(|e| e.to_string())?;
+        draw(&ime, &typed, &up, last_ms).map_err(|e| e.to_string())?;
         let ev = event::read().map_err(|e| e.to_string())?;
         let Event::Key(ke) = ev else { continue };
         if ke.kind == KeyEventKind::Release {
@@ -251,15 +245,6 @@ fn interactive() -> Result<(), String> {
         }
         if ctrl && ke.code == KeyCode::Char('l') {
             typed.clear();
-            continue;
-        }
-        // Ctrl+T：日常 / 书面 切换
-        if ctrl && ke.code == KeyCode::Char('t') {
-            formal = !formal;
-            match open_lm_style(formal) {
-                Some(lm) => ime.set_lm(lm),
-                None => formal = !formal,
-            }
             continue;
         }
         let key = match ke.code {
@@ -284,7 +269,7 @@ fn interactive() -> Result<(), String> {
     Ok(())
 }
 
-fn draw(ime: &Ime, typed: &str, user_path: &Path, ms: f64, formal: bool) -> std::io::Result<()> {
+fn draw(ime: &Ime, typed: &str, user_path: &Path, ms: f64) -> std::io::Result<()> {
     let mut o = stdout();
     queue!(o, terminal::Clear(terminal::ClearType::All), cursor::MoveTo(0, 0))?;
     let mut line = 0u16;
@@ -295,16 +280,8 @@ fn draw(ime: &Ime, typed: &str, user_path: &Path, ms: f64, formal: bool) -> std:
     }
     put_line(&mut o, &mut line, "拼音输入法 · 试打工具        Ctrl+C 退出    Ctrl+L 清空下面打出的文字")?;
     let mode = if ime.view().english_mode { "英（纯英文）" } else { "中" };
-    let style = match (ime.lm().is_some(), formal) {
-        (false, _) => "没有语言模型",
-        (true, false) => "日常",
-        (true, true) => "书面",
-    };
-    put_line(
-        &mut o,
-        &mut line,
-        &format!("现在：{mode} · {style}        Tab = 单按 Shift（中/英切换）    Ctrl+T = 日常/书面切换"),
-    )?;
+    let lm = if ime.lm().is_some() { "有语言模型" } else { "没有语言模型" };
+    put_line(&mut o, &mut line, &format!("现在：{mode} · {lm}        Tab = 单按 Shift（中/英切换）"))?;
     put_line(
         &mut o,
         &mut line,

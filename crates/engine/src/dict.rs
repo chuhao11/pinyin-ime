@@ -324,6 +324,30 @@ impl Dict {
         self.child_edges(node).map(move |e| (self.edge_syl(e), self.edge_node(e)))
     }
 
+    /// 沿着拼音走到的节点（没有这个拼音就是 None）。
+    pub fn node_for(&self, code: &[u16]) -> Option<u32> {
+        let mut node = self.root();
+        for &syl in code {
+            let r = self.child_edges_in(node, syl, syl + 1);
+            if r.is_empty() {
+                return None;
+            }
+            node = self.edge_node(r.start);
+        }
+        Some(node)
+    }
+
+    /// 词库里有没有这个读音的这个词。
+    pub fn has_word(&self, code: &[u16], text: &str) -> bool {
+        self.find_word(code, text).is_some()
+    }
+
+    /// 这个读音的这个词在词库里的编号。
+    pub fn find_word(&self, code: &[u16], text: &str) -> Option<u32> {
+        let node = self.node_for(code)?;
+        self.node_words(node).find(|&w| self.word_text(w) == text)
+    }
+
     /// 遍历所有字词：回调 (拼音编号, 字词编号)。
     pub fn for_each_word(&self, mut f: impl FnMut(&[u16], u32)) {
         let mut stack: Vec<(u32, Vec<u16>)> = vec![(self.root(), Vec::new())];

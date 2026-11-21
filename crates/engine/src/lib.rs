@@ -9,6 +9,8 @@
 //! - `session`：按键规则
 //! - `service`：引擎进程收到请求后怎么处理
 
+pub mod addwords;
+pub mod adjust;
 pub mod dict;
 pub mod english;
 pub mod lattice;
@@ -23,5 +25,7 @@ pub use english::EnglishDict;
 pub use lattice::{analyze_with, CandKind, Candidate, Query};
 pub use lm::Lm;
 pub use service::Service;
-pub use session::{display_width, Config, Engine, Ime, Key, Mode, Mods, Response, Session, View, GRID_COLS, GRID_SIZE};
+pub use session::{
+    display_width, AddResult, Config, Engine, Ime, Key, Mode, Mods, Response, Session, View, GRID_COLS, GRID_SIZE,
+};
 pub use userdb::UserDb;

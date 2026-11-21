@@ -7,6 +7,7 @@
 //! - `Session`：每个程序（每个输入框）自己的输入状态（正在打的拼音、候选、上文）
 //! - `Ime`：一个 Engine 配一个 Session，单个程序用起来方便（试打工具、测试）
 
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::dict::Dict;
@@ -133,6 +134,16 @@ pub struct Engine {
     pub config: Config,
     /// 纯英文输入（单按 Shift 切换，所有程序一起）
     english_mode: bool,
+    /// 每个字的读音（第一次加词时才建，给"添加词语"定拼音用）
+    readings: Option<HashMap<char, Vec<(u16, f32)>>>,
+}
+
+/// 加入词语的结果
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct AddResult {
+    pub added: usize,
+    /// 跳过的词和原因，比如 "abc（只能加汉字）"
+    pub skipped: Vec<String>,
 }
 
 fn system_now() -> i64 {
@@ -199,7 +210,33 @@ impl Engine {
             clock: Box::new(system_now),
             config: Config::default(),
             english_mode: false,
+            readings: None,
         }
+    }
+
+    /// 设置页"添加词语"：词语之间用任意标点、空格隔开，多音字可以写成 词语(pin yin)。
+    /// 加入的词用全拼打时排第二个；以后和别的词一样，用得多排第一。
+    pub fn add_words(&mut self, text: &str) -> AddResult {
+        let now = self.now();
+        let readings = self.readings.get_or_insert_with(|| crate::addwords::char_readings(&self.dict));
+        let mut r = AddResult::default();
+        for (i, (w, py)) in crate::addwords::split(text).into_iter().enumerate() {
+            if i >= crate::addwords::MAX_WORDS {
+                r.skipped.push(format!("一次最多加 {} 个词，后面的没加", crate::addwords::MAX_WORDS));
+                break;
+            }
+            match crate::addwords::pinyin_of(&self.dict, readings, &w, py.as_deref()) {
+                Ok(code) => {
+                    if self.user.add_word(&self.dict, &code, &w, now) {
+                        r.added += 1;
+                    } else {
+                        r.skipped.push(format!("{w}（已经加过了）"));
+                    }
+                }
+                Err(why) => r.skipped.push(format!("{w}（{why}）")),
+            }
+        }
+        r
     }
 
     /// 装上英文词表。
@@ -493,6 +530,21 @@ impl Engine {
 
     /// 你选的多字词不是"本来该排第一"的那个：给那个词记一次冷落（单字不算）。
     fn note_rejection(&mut self, s: &Session, chosen: &Candidate) {
+        let now = self.now();
+        // 纠错的候选排在前面，你却选了原样拼写的：记住"这样打不是打错"，以后这个纠错不再排前面
+        if chosen.fixes.is_empty() {
+            let typed = s.remaining().to_ascii_lowercase();
+            let above: Vec<String> = s
+                .cands
+                .iter()
+                .take_while(|c| c.text != chosen.text)
+                .filter(|c| !c.fixes.is_empty() && c.consumed == chosen.consumed)
+                .map(|c| c.text.clone())
+                .collect();
+            for t in above {
+                self.user.reject_fix(&typed, &t, now);
+            }
+        }
         if !matches!(chosen.kind, CandKind::Word | CandKind::Sentence) || chosen.text.chars().count() < 2 {
             return;
         }
@@ -508,7 +560,7 @@ impl Engine {
                 && t.fixes.is_empty()
                 && !t.code.is_empty()
             {
-                self.user.reject(&self.dict, &t.code, &t.text);
+                self.user.reject(&self.dict, &t.code, &t.text, now);
             }
         }
     }
@@ -542,6 +594,8 @@ impl Engine {
     /// 上屏全部已选的字，记住用过的词，然后清空。`extra` 是跟在后面的符号。
     fn finish(&mut self, s: &mut Session, extra: Option<String>) -> Response {
         let now = self.now();
+        // 个别几类记录按时间清理（一天最多一次）
+        self.user.maybe_maintain(&self.dict, now);
         let mut text: String = s.selected.iter().map(|x| x.text.as_str()).collect();
         // 前后词关联：记住"上一个词后面选了什么"（上一次上屏的词，以及这次分几段选的前后两段）
         if let Some(lm) = &self.lm {
@@ -607,7 +661,13 @@ impl Engine {
                 _ => s.cands.first().filter(|c| covers(c)).cloned(),
             };
             match pick {
-                Some(c) => self.take(s, c),
+                Some(c) => {
+                    // 用方向键挑了别的再按空格：和按数字选一样记下来
+                    if s.hl > 0 {
+                        self.note_rejection(s, &c);
+                    }
+                    self.take(s, c)
+                }
                 None => {
                     let raw = s.remaining().to_string();
                     let start = s.consumed;
@@ -691,6 +751,10 @@ impl Ime {
 
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    pub fn add_words(&mut self, text: &str) -> AddResult {
+        self.engine.add_words(text)
     }
 
     pub fn engine_mut(&mut self) -> &mut Engine {

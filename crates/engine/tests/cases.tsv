@@ -76,3 +76,27 @@ what	what	1
 immediately	immediately	1
 hello	hello	1
 recieve	receive	3
+
+# 真正的词排在单字拼出来的组合前面（坎潘、张廷、马德不是词）
+kanpan	看盘	1
+zhangting	涨停	1
+zuoyige	做一个	1
+# 中性：股票、专业词要靠前，百科味的词（犬种、西接、西街）不能抢常用词
+quanzhong	权重	1
+xijie	细节	1
+xijie	西接	-
+xijie	西街	-
+gegu	个股	1
+dapan	大盘	1
+shiyinglv	市盈率	1
+lianghua	量化	1
+chaodi	抄底	2
+# 正常写法在避讳写法前面，老的谐音梗往后
+made	妈的	1
+beiju	悲剧	1
+shenme	什么	1
+# 前后鼻音打混：常用词在后面留着（候选条里能看到）
+jingzhi	禁止	8
+jinzhi	精致	8
+# 原样拼写就是常用词的，不被纠错抢走
+zheye	这也	1

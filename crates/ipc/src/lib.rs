@@ -46,15 +46,34 @@ pub enum Request {
     SetEnglishMode {
         on: bool,
     },
+    /// 设置页里加入词语：一段文字，词语之间用任意标点、空格、换行隔开；
+    /// 多音字可以写成 词语(pin yin)
+    AddWords {
+        text: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reply {
-    Hello { proto: u32 },
-    KeyResult { consumed: bool, commit: Option<String>, view: View },
+    Hello {
+        proto: u32,
+    },
+    KeyResult {
+        consumed: bool,
+        commit: Option<String>,
+        view: View,
+    },
     Bool(bool),
     Ok,
-    State { english_mode: bool, chinese_punct: bool, formal: bool },
+    State {
+        english_mode: bool,
+        chinese_punct: bool,
+    },
+    /// 加入词语的结果：加了几个，跳过的（和原因）
+    WordsAdded {
+        added: u32,
+        skipped: Vec<String>,
+    },
     Error(String),
 }
 
@@ -256,6 +275,10 @@ impl Request {
                 e.u8(8);
                 e.bool(*on);
             }
+            Request::AddWords { text } => {
+                e.u8(9);
+                e.str(text);
+            }
         }
         e.0
     }
@@ -271,6 +294,7 @@ impl Request {
             6 => Request::GetState,
             7 => Request::ReloadSettings,
             8 => Request::SetEnglishMode { on: d.bool()? },
+            9 => Request::AddWords { text: d.str()? },
             _ => return Err(DecodeError("请求类型不对")),
         };
         d.done()?;
@@ -303,11 +327,19 @@ impl Reply {
                 e.bool(*v);
             }
             Reply::Ok => e.u8(4),
-            Reply::State { english_mode, chinese_punct, formal } => {
+            Reply::State { english_mode, chinese_punct } => {
                 e.u8(5);
                 e.bool(*english_mode);
                 e.bool(*chinese_punct);
-                e.bool(*formal);
+            }
+            Reply::WordsAdded { added, skipped } => {
+                e.u8(6);
+                e.u32(*added);
+                let n = skipped.len().min(MAX_ITEMS);
+                e.u32(n as u32);
+                for x in &skipped[..n] {
+                    e.str(x);
+                }
             }
             Reply::Error(s) => {
                 e.u8(255);
@@ -328,7 +360,19 @@ impl Reply {
             }
             3 => Reply::Bool(d.bool()?),
             4 => Reply::Ok,
-            5 => Reply::State { english_mode: d.bool()?, chinese_punct: d.bool()?, formal: d.bool()? },
+            5 => Reply::State { english_mode: d.bool()?, chinese_punct: d.bool()? },
+            6 => {
+                let added = d.u32()?;
+                let n = d.u32()? as usize;
+                if n > MAX_ITEMS {
+                    return Err(DecodeError("跳过的词太多"));
+                }
+                let mut skipped = Vec::with_capacity(n);
+                for _ in 0..n {
+                    skipped.push(d.str()?);
+                }
+                Reply::WordsAdded { added, skipped }
+            }
             255 => Reply::Error(d.str()?),
             _ => return Err(DecodeError("回复类型不对")),
         };
@@ -384,6 +428,9 @@ pub fn user_dir() -> PathBuf {
     PathBuf::from(base).join("PinyinIME")
 }
 
+/// 设置页在引擎没运行时，要加入的词先写到这个文件（和 settings.ini 在同一个文件夹），引擎启动时读进来。
+pub const PENDING_WORDS: &str = "pending_words.txt";
+
 pub fn settings_path() -> PathBuf {
     user_dir().join("settings.ini")
 }
@@ -391,8 +438,6 @@ pub fn settings_path() -> PathBuf {
 /// 设置（存在 %APPDATA%\PinyinIME\settings.ini，一行一项：键=值）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Settings {
-    /// 书面模式（否则是日常）
-    pub formal: bool,
     /// 中文标点
     pub chinese_punct: bool,
 }
@@ -403,11 +448,10 @@ impl Settings {
         let Ok(text) = std::fs::read_to_string(path) else { return s };
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
-            let on = matches!(v.trim(), "1" | "true" | "yes" | "formal");
-            match k.trim() {
-                "style" => s.formal = v.trim() == "formal",
-                "chinese_punct" => s.chinese_punct = on,
-                _ => {}
+            let on = matches!(v.trim(), "1" | "true" | "yes");
+            // 以前的 style=（日常/书面）不用了，读到就忽略
+            if k.trim() == "chinese_punct" {
+                s.chinese_punct = on;
             }
         }
         s
@@ -418,8 +462,7 @@ impl Settings {
             std::fs::create_dir_all(d)?;
         }
         let text = format!(
-            "# 拼音输入法设置（也可以在桌面上的\"拼音输入法设置\"里改）\nstyle={}\nchinese_punct={}\n",
-            if self.formal { "formal" } else { "daily" },
+            "# 拼音输入法设置（也可以在桌面上的\"拼音输入法设置\"里改）\nchinese_punct={}\n",
             if self.chinese_punct { "true" } else { "false" }
         );
         // 先写临时文件再改名，写到一半断电也不会坏
@@ -444,6 +487,7 @@ mod tests {
             Request::GetState,
             Request::ReloadSettings,
             Request::SetEnglishMode { on: true },
+            Request::AddWords { text: "张子涵，螺蛳粉 曾经(zeng jing)".into() },
         ]
     }
 
@@ -474,7 +518,8 @@ mod tests {
             Reply::KeyResult { consumed: false, commit: None, view },
             Reply::Bool(true),
             Reply::Ok,
-            Reply::State { english_mode: true, chinese_punct: false, formal: true },
+            Reply::State { english_mode: true, chinese_punct: false },
+            Reply::WordsAdded { added: 3, skipped: vec!["abc（有字母）".into()] },
             Reply::Error("出错".into()),
         ] {
             assert_eq!(Reply::decode(&r.encode()).unwrap(), r);
@@ -509,7 +554,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pyime-set-{}", std::process::id()));
         let p = dir.join("settings.ini");
         assert_eq!(Settings::load(&p), Settings::default());
-        let s = Settings { formal: true, chinese_punct: true };
+        let s = Settings { chinese_punct: true };
         s.save(&p).unwrap();
         assert_eq!(Settings::load(&p), s);
         let _ = std::fs::remove_dir_all(&dir);

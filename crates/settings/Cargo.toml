@@ -1,6 +1,6 @@
 [package]
 name = "pinyin-settings"
-description = "设置页：文风（日常/书面）、中文标点（开/关）"
+description = "设置页：中文标点（开/关）、添加词语"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -15,5 +15,5 @@ pinyin-types = { path = "../types" }
 
 [target."cfg(windows)".dependencies]
 pinyin-winpipe = { path = "../winpipe" }
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Dwm", "Win32_Graphics_Imaging", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_UI_HiDpi"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Dwm", "Win32_Graphics_Imaging", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_UI_HiDpi", "Win32_UI_Controls"] }
 windows-numerics = "0.3"

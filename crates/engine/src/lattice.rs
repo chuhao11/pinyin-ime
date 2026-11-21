@@ -10,6 +10,7 @@
 
 use std::collections::HashSet;
 
+use crate::adjust::adjust;
 use crate::dict::Dict;
 use crate::english::{edit_cost, match_case, max_cost, EnglishDict};
 use crate::lm::{Lm, START_TOKEN};
@@ -65,6 +66,10 @@ const RECENT_SLOT: usize = 3;
 const RECENT_SECS: i64 = 60 * 86400;
 /// 打的正好是一个完整音节时，前几个位置留给这个音的单字（`gun` → 滚 棍 衮，然后才是"姑娘"这种词）。
 const SINGLE_HEAD: usize = 3;
+/// 单字后面的第一个位置留给全拼对上的词（xian → 先 县 现 西安），只要它和第三个单字差得不多
+const WORD_AFTER_SINGLES_GAP: f32 = 3.0;
+/// 你在设置页加入、还没用过的词排在第几个（从 0 数）
+const ADDED_SLOT: usize = 1;
 /// 你经常打的词（有效次数达到这么多）不受上面的限制，可以排在单字前面。
 const OFTEN_USED: f64 = 2.0;
 /// 单字"几十次就改"：一个字你选了这么多次，而且比现在排第一的字多选一半以上，它就排第一。
@@ -73,7 +78,7 @@ const CHAR_TAKEOVER_RATIO: f64 = 1.5;
 /// 上文（刚上屏的词）对下一个字词分数的影响上限：上文只能微调，不能让一个不相干的字突然排第一。
 /// 单字更严：单字的顺序要你自己选几十次才会变。
 const CTX_UP_CHAR: f32 = 1.0;
-const CTX_UP_WORD: f32 = 2.5;
+const CTX_UP_WORD: f32 = 1.5;
 const CTX_DOWN: f32 = 3.0;
 /// 真正常见的搭配（前一个词后面接它的概率至少 5%，比如 走→吧、数字→年）上限放宽到这么多
 const CTX_UP_STRONG: f32 = 3.0;
@@ -83,6 +88,19 @@ const STRONG_PAIR: f32 = -3.0;
 const CTX_JOINED: f32 = 2.0;
 /// 连起来的词至少要这么常见才算（太生僻的组合不算）
 const JOINED_MIN_UNI: f32 = -15.0;
+/// 这个字在这里的读音至少占它所有读音的这么多（ln 0.2），连起来是词才加分：
+/// "他的"是词，但打 di 时的"的"读 dí，不该因为"他的"加分
+const JOINED_MIN_READING: f32 = -1.6;
+/// 几个字词拼起来的整句，比能对上整串的一个真正的词好这么多，才排在它前面（kanpan：看盘 在 坎潘 前面）
+const COMBO_OVER_WORD: f32 = 1.5;
+/// 排不到最前面的整句放在第几个：几个单字拼的放在前 3 个词后面，带多字词的放在第一个词后面
+const COMBO_AFTER_CHARS: usize = 3;
+/// 纠错的候选，比你原样打的最好的候选好这么多才排第一；否则放在第 FIX_SLOT+1 个（zheye：这也 在 这个 前面）
+const FIX_MARGIN: f32 = 3.0;
+const FIX_SLOT: usize = 1;
+/// 前后鼻音打混的候选：常用的留几个，放在第 NASAL_SLOT+1 个起
+const NASAL_SLOT: usize = 4;
+const NASAL_KEEP: usize = 2;
 /// 一个词里最多纠正几处。
 const MAX_FIXES_PER_WORD: usize = 1;
 
@@ -120,6 +138,8 @@ pub struct Candidate {
     pub typed_code: Option<Vec<u16>>,
     /// 最后一个词在语言模型里的编号（上屏后当下一次输入的上文）
     pub last_lm: Option<u32>,
+    /// 全是完整音节、没有纠正、没有简拼（你打的就是它的全拼）
+    pub exact: bool,
 }
 
 impl Candidate {
@@ -140,7 +160,12 @@ impl Candidate {
             fixes: Vec::new(),
             typed_code: None,
             last_lm: None,
+            exact: false,
         }
+    }
+
+    fn nasal(&self) -> bool {
+        !self.fixes.is_empty() && self.fixes.iter().all(|f| f.is_nasal())
     }
 }
 
@@ -201,6 +226,7 @@ impl Hit {
         };
         let prev_text = lm.word(p);
         let joined = !prev_text.starts_with('<')
+            && self.rd >= JOINED_MIN_READING
             && lm.id(&format!("{prev_text}{text}")).is_some_and(|j| lm.uni(j) >= JOINED_MIN_UNI);
         self.score + if joined { pair.max(CTX_JOINED) } else { pair }
     }
@@ -269,6 +295,10 @@ impl Walk {
 
 /// 单字的分数里，"单独打这个字的频率"（语言模型）占多少；其余是词库里的总频率（含在词里出现的）。
 const SINGLE_LM_SHARE: f32 = 0.7;
+/// 多字词的分数：一半看语言模型，一半看词库里的使用频率。
+/// 语言模型的语料里有维基百科，百科里多、平时少用的词（犬种、西接、角色名）会被抬高；
+/// 词库频率来自很广的语料，不偏口语也不偏书面，两边各一半比较中性
+const WORD_LM_SHARE: f32 = 0.5;
 
 /// ln(w·e^a + (1−w)·e^b)
 fn log_mix(a: f32, b: f32, w: f32) -> f32 {
@@ -287,7 +317,10 @@ fn word_uni(ctx: &Ctx, text: &str, dict_score: f32, reading: f32) -> (Option<u32
     match id {
         Some(id) if single => (Some(id), log_mix(lm.uni(id) + reading, dict_score, SINGLE_LM_SHARE)),
         None if single => (None, dict_score),
-        Some(id) => (Some(id), lm.uni(id) + reading),
+        Some(id) => {
+            let w = WORD_LM_SHARE;
+            (Some(id), w * (lm.uni(id) + reading) + (1.0 - w) * lm.fallback(dict_score))
+        }
         None => (None, lm.fallback(dict_score)),
     }
 }
@@ -297,7 +330,9 @@ fn dfs_dict(ctx: &Ctx, node: u32, pos: usize, pen: f32, w: &mut Walk, limit: usi
     if w.can_emit() {
         for wi in ctx.dict.node_words(node).take(limit) {
             let rd = ctx.dict.word_reading(wi);
-            let (lm, uni) = word_uni(ctx, ctx.dict.word_text(wi), ctx.dict.word_score(wi), rd);
+            let text = ctx.dict.word_text(wi);
+            let (lm, uni) = word_uni(ctx, text, ctx.dict.word_score(wi), rd);
+            let pen = pen + adjust(text);
             out.push(Hit {
                 end: pos,
                 src: Src::Dict(wi),
@@ -657,7 +692,12 @@ pub fn analyze_with(q: &Query, input: &str) -> Vec<Candidate> {
         fixes: p.fixes.clone(),
         typed_code: p.typed_code.clone(),
         last_lm: p.last_lm,
+        exact: p.exact && p.fixes.is_empty(),
     };
+    // 整句（几个字词拼成的）：先拿出来，排好真正的词以后再决定放哪
+    // (候选, 是不是要排在最前, 是不是全由单字拼成)
+    let mut sentence: Option<(Candidate, bool, bool)> = None;
+    let mut fixed_sentence: Option<Candidate> = None;
     if let Some(b) = &best {
         if !b.raw && b.pieces >= 2 {
             if plain_needs_raw && !b.fixes.is_empty() {
@@ -666,9 +706,46 @@ pub fn analyze_with(q: &Query, input: &str) -> Vec<Candidate> {
                 c.poor = true;
                 tail.push(c);
             } else {
-                out.push(sentence_cand(b));
+                let all = || (0..paths[n].len()).map(&extract);
+                // 纠错拼出来的整句，原样拼写的也差不多好：用原样的，纠错的往后放
+                let plain = if b.fixes.is_empty() {
+                    None
+                } else {
+                    all().find(|p| p.fixes.is_empty() && !p.raw && p.score >= b.score - FIX_MARGIN)
+                };
+                let main = match plain {
+                    Some(p) => {
+                        fixed_sentence = Some(sentence_cand(b));
+                        p
+                    }
+                    None => extract(0),
+                };
+                if main.pieces >= 2 {
+                    let chars_only = main.text.chars().count() == main.pieces;
+                    // 有一个真正的词（全拼对上、不纠错）能对上整串：
+                    // 全是单字拼的组合（坎潘、张廷）排在它后面；带多字词的整句要明显更好才排在它前面
+                    let real_word = first_hits.iter().any(|h| {
+                        skip_apos(s, h.end) >= n
+                            && h.exact
+                            && h.fixes.is_empty()
+                            && hit_text(&ctx, h).chars().nth(1).is_some()
+                    });
+                    let word = all().find(|p| p.pieces == 1 && !p.raw && p.fixes.is_empty());
+                    let first = if chars_only && real_word {
+                        false
+                    } else {
+                        word.is_none_or(|w| main.score >= w.score + COMBO_OVER_WORD)
+                    };
+                    sentence = Some((sentence_cand(&main), first, chars_only));
+                }
             }
         }
+    }
+    // 你拒绝过的纠错（打 zheye 选了"这也"，就不再把"这个"排前面）
+    let fix_rejected = |c: &Candidate| !c.fixes.is_empty() && user.fix_rejected(&lower, &c.text);
+    let first_full = out.len();
+    if let Some((c, true, _)) = &sentence {
+        out.push(c.clone());
     }
 
     // ---- 英文 ----
@@ -731,6 +808,7 @@ pub fn analyze_with(q: &Query, input: &str) -> Vec<Candidate> {
         fixes: h.fixes.iter().map(|f| f.1).collect(),
         typed_code: h.typed_code(),
         last_lm: h.lm,
+        exact: h.exact && h.fixes.is_empty(),
     };
     let mut full: Vec<&Hit> = first_hits.iter().filter(|h| covers_all(h.end)).collect();
     full.sort_by(|a, b| (b.rank_score() + multi(b)).total_cmp(&(a.rank_score() + multi(a))));
@@ -749,11 +827,26 @@ pub fn analyze_with(q: &Query, input: &str) -> Vec<Candidate> {
     let best_part_base = part.iter().map(|h| h.score).fold(f32::NEG_INFINITY, f32::max);
 
     // 全部对上的字词
+    // 原样拼写的最好的词（纠错的要比它好很多才排第一）
+    let best_exact_word =
+        full.iter().filter(|h| h.fixes.is_empty()).map(|h| h.rank_score() + multi(h)).fold(f32::NEG_INFINITY, f32::max);
+    let mut deferred_fix: Vec<Candidate> = Vec::new();
+    let mut nasal: Vec<Candidate> = Vec::new();
     for h in &full {
         let base = h.score + multi(h);
         let multi_char = hit_text(&ctx, h).chars().count() >= 2;
         let poor = base < best_full_base - POOR_GAP;
-        let unneeded_fix = !h.fixes.is_empty() && h.rank_score() < best_plain;
+        let c = word_cand(h, false);
+        if c.nasal() {
+            // 前后鼻音打混：常用的留几个在后面（禁止打成 jingzhi）
+            if !poor && !fix_rejected(&c) && multi_char {
+                nasal.push(c);
+            } else {
+                tail.push(word_cand(h, true));
+            }
+            continue;
+        }
+        let unneeded_fix = !h.fixes.is_empty() && (h.rank_score() < best_plain || fix_rejected(&c));
         let weak = unneeded_fix
             || multi_char
                 && h.bonus == 0.0
@@ -761,9 +854,34 @@ pub fn analyze_with(q: &Query, input: &str) -> Vec<Candidate> {
                 && h.score < best_part_base - WEAK_VS_PARTIAL_GAP;
         if poor || weak {
             tail.push(word_cand(h, true));
+        } else if !h.fixes.is_empty() && c.score < best_exact_word + FIX_MARGIN {
+            // 原样拼写的也很常用：纠错的往后放一点
+            deferred_fix.push(c);
         } else {
-            out.push(word_cand(h, false));
+            out.push(c);
         }
+    }
+    // 没排在最前的整句：放在真正的词后面
+    if let Some((c, false, chars_only)) = sentence {
+        let after = if chars_only { COMBO_AFTER_CHARS } else { 1 };
+        let pos = (first_full + after).min(out.len());
+        out.insert(pos, c);
+    }
+    // 纠错的放在第 FIX_SLOT+1 个（不在最前，但一眼能看到）
+    for c in fixed_sentence.into_iter().filter(|c| !fix_rejected(c)).chain(deferred_fix) {
+        let pos = (first_full + FIX_SLOT).min(out.len());
+        out.insert(pos, c);
+    }
+    // 前后鼻音打混的：最常用的几个放在第 NASAL_SLOT+1 个起
+    nasal.sort_by(|a, b| b.score.total_cmp(&a.score));
+    let nasal_tail = nasal.split_off(nasal.len().min(NASAL_KEEP));
+    let start = (first_full + NASAL_SLOT).min(out.len());
+    for (pos, c) in (start..).zip(nasal) {
+        out.insert(pos, c);
+    }
+    for mut c in nasal_tail {
+        c.poor = true;
+        tail.push(c);
     }
     // 组合（好+胀 这种）
     let mut combo_more: Vec<Candidate> = Vec::new();
@@ -853,8 +971,23 @@ pub fn analyze_with(q: &Query, input: &str) -> Vec<Candidate> {
             let head: Vec<Candidate> = out.drain(..=last).collect();
             let (keep, later): (Vec<Candidate>, Vec<Candidate>) =
                 head.into_iter().partition(|c| is_single(c) || often(c) || c.kind == CandKind::Raw);
-            let rest = std::mem::take(&mut out);
-            out = keep.into_iter().chain(later).chain(rest).collect();
+            let third = keep.iter().filter(|c| is_single(c)).map(|c| c.score).fold(f32::INFINITY, f32::min);
+            let mut after: Vec<Candidate> = later.into_iter().chain(std::mem::take(&mut out)).collect();
+            // 紧接着单字的位置：全拼对上的最好的词（西安、企鹅），不能是简拼拆开的（姑娘）
+            let word = after
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    c.kind == CandKind::Word && c.exact && c.consumed == n && c.text.chars().nth(1).is_some()
+                })
+                .max_by(|a, b| a.1.score.total_cmp(&b.1.score))
+                .filter(|(_, c)| c.score >= third - WORD_AFTER_SINGLES_GAP)
+                .map(|(i, _)| i);
+            if let Some(i) = word {
+                let c = after.remove(i);
+                after.insert(0, c);
+            }
+            out = keep.into_iter().chain(after).collect();
         }
     }
     // 单字"几十次就改"：你一直选的那个字排到单字的第一位
@@ -900,6 +1033,20 @@ pub fn analyze_with(q: &Query, input: &str) -> Vec<Candidate> {
             for x in out.iter_mut().take(RECENT_SLOT) {
                 x.poor = false;
             }
+        }
+    }
+    // 你在设置页加入、还没用过的词：用全拼打时排第二个（用过以后和别的词一样靠记忆排序）
+    let added = out.iter().position(|c| {
+        c.kind == CandKind::Word
+            && c.exact
+            && c.consumed == n
+            && user.lookup(&c.code, &c.text).is_some_and(|e| e.added && e.effective(now) < 1.0)
+    });
+    if let Some(i) = added {
+        if i > ADDED_SLOT {
+            let mut c = out.remove(i);
+            c.poor = false;
+            out.insert(ADDED_SLOT, c);
         }
     }
     out.truncate(MAX_CANDS);

@@ -30,6 +30,9 @@ pub const PEN_PARTIAL: f32 = -0.5;
 /// 简拼把一个完整音节拆开了，再多扣这么多：`gun` 本身是完整音节，切成 gu + n（姑娘）、
 /// `lin` 切成 li + n（理念）、`xiang` 切成 xian + g，都不是你想打的，除非你经常打那个词。
 pub const PEN_SPLIT_SYLLABLE: f32 = -3.0;
+/// 前后鼻音打混（in/ing、en/eng、an/ang、ian/iang、uan/uang）的扣分：比别的打错轻，
+/// 常用词会在候选后面留几个（见 lattice.rs），但不会抢前面的位置。只用在多字词里。
+pub const PEN_NASAL: f32 = -3.5;
 /// 打错纠正的扣分：按到旁边的键、两个字母打反、多打一个、漏打一个。
 pub const PEN_NEIGHBOR: f32 = -5.0;
 pub const PEN_SWAP: f32 = -4.5;
@@ -58,6 +61,14 @@ pub struct Fix {
 }
 
 impl Fix {
+    /// 前后鼻音：在 n 后面补一个 g，或者去掉 ng 的 g
+    pub const NASAL_ADD_G: Fix = Fix { from: [0, 0], to: [b'g', 0] };
+    pub const NASAL_DROP_G: Fix = Fix { from: [b'g', 0], to: [0, 0] };
+
+    pub fn is_nasal(&self) -> bool {
+        *self == Self::NASAL_ADD_G || *self == Self::NASAL_DROP_G
+    }
+
     fn part(b: &[u8; 2]) -> String {
         b.iter().filter(|&&c| c != 0).map(|&c| c as char).collect()
     }
@@ -186,6 +197,29 @@ pub fn tokenize(dict: &Dict, s: &[u8], fix_bonus: &dyn Fn(&Fix) -> f32) -> Vec<V
                     });
                     soft = true;
                     typed = Some(id);
+                    // 前后鼻音：jing ↔ jin、shen ↔ sheng……（禁止打成 jingzhi）
+                    let alt = if piece.ends_with("ng") {
+                        Some((piece[..piece.len() - 1].to_string(), Fix::NASAL_DROP_G))
+                    } else if piece.ends_with('n') {
+                        Some((format!("{piece}g"), Fix::NASAL_ADD_G))
+                    } else {
+                        None
+                    };
+                    if let Some((alt, fix)) = alt {
+                        if let Some(aid) = full_id(dict, &alt) {
+                            out[i].push(Token {
+                                end: j,
+                                lo: aid,
+                                hi: aid + 1,
+                                kind: TokKind::Fixed,
+                                pen: PEN_NASAL + fix_bonus(&fix).clamp(0.0, MAX_FIX_BONUS),
+                                fix: Some(fix),
+                                soft: true,
+                                typed: Some(id),
+                                second: None,
+                            });
+                        }
+                    }
                 } else if INITIALS.contains(&piece) {
                     soft = true;
                     // 声母后面紧跟的字母能和它拼成音节（比如 g 后面是 a），说明你在打全拼，
