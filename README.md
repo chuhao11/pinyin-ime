@@ -89,3 +89,19 @@ cargo test --release --workspace
 ```
 
 包括：按键规则、记忆、打字回归测试（用真实词库）、连续 12 万次按键的内存测试。GitHub 上每次提交都会在 Windows 和 Mac 上各跑一遍。
+
+## 许可证和数据来源
+
+本项目以 [GPL-3.0](LICENSE) 发布：可以自由使用、修改、再发布；修改后再发布也要以 GPL-3.0 开源。
+
+用到的数据（编译时下载，不在仓库里）：
+
+| 数据 | 用途 | 来源 |
+|---|---|---|
+| 雾凇拼音 rime-ice（GPL-3.0） | 中文词库、英文词库 | [iDvel/rime-ice](https://github.com/iDvel/rime-ice) |
+| Unicode Unihan 18.0 | 字的等级、笔画 | [unicode.org](https://www.unicode.org/charts/unihan.html) |
+| google-10000-english | 英文词频 | [first20hours/google-10000-english](https://github.com/first20hours/google-10000-english) |
+| LCCC 对话语料（清华） | 语言模型：日常口语 | [thu-coai/CDial-GPT](https://github.com/thu-coai/CDial-GPT) |
+| 中文维基百科（CC BY-SA 4.0） | 语言模型：书面语 | [zh.wikipedia.org](https://zh.wikipedia.org) |
+
+语言模型只保存词和词之间的统计次数，不包含原文。
