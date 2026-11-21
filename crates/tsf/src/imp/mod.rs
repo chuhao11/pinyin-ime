@@ -2,6 +2,7 @@
 
 mod candwin;
 mod client;
+mod debug;
 mod edit;
 mod factory;
 mod keys;

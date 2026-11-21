@@ -8,6 +8,7 @@
 //! - 任何出错都兜住，绝不让程序崩溃
 
 use std::cell::RefCell;
+use std::time::{Duration, Instant};
 
 use pinyin_ipc::{Reply, Request};
 use pinyin_types::{Key, Mods};
@@ -26,10 +27,13 @@ use windows::Win32::UI::TextServices::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetGUIThreadInfo, GUITHREADINFO};
 
+use windows::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT;
+use windows::Win32::UI::TextServices::{TF_MOD_ON_KEYUP, TF_MOD_SHIFT, TF_PRESERVEDKEY};
+
 use super::client::EngineClient;
 use super::edit::{Action, EditSession};
 use super::keys::{self, ShiftTracker};
-use super::{candwin, guard};
+use super::{candwin, debug, guard};
 
 #[derive(Default)]
 struct State {
@@ -46,7 +50,26 @@ struct State {
     eaten: Vec<u32>,
     /// 全屏游戏里按 Shift 临时打开了中文
     game_chinese: bool,
+    /// 上一次中英切换的时间：系统的"单按 Shift"和自己的检测可能都报一次，只切一次
+    last_toggle: Option<Instant>,
+    preserved: bool,
 }
+
+/// 系统帮我们检测"单独按一下 Shift"（和微软示例输入法一样用"保留键"）。
+/// 登记两种写法：有的程序松开 Shift 时还算 Shift 按着，有的不算。
+const PRESERVE_SHIFT: GUID = GUID::from_u128(0x6a1d2c4e_83b7_4f0a_9c55_1e2f3a4b5c6d);
+const PRESERVE_SHIFT2: GUID = GUID::from_u128(0x6a1d2c4e_83b7_4f0a_9c55_1e2f3a4b5c6e);
+
+fn preserved_keys() -> [(GUID, TF_PRESERVEDKEY); 2] {
+    let vk = VK_SHIFT.0 as u32;
+    [
+        (PRESERVE_SHIFT, TF_PRESERVEDKEY { uVKey: vk, uModifiers: TF_MOD_ON_KEYUP | TF_MOD_SHIFT }),
+        (PRESERVE_SHIFT2, TF_PRESERVEDKEY { uVKey: vk, uModifiers: TF_MOD_ON_KEYUP }),
+    ]
+}
+
+/// 两次报告之间不超过这么久，算同一次按键
+const SAME_TAP: Duration = Duration::from_millis(400);
 
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfThreadMgrEventSink, ITfCompositionSink)]
 pub struct TextService {
@@ -190,7 +213,11 @@ impl TextService_Impl {
 
     fn test_key_down(&self, ctx: Option<ITfContext>, vk: u32, lp: isize) -> bool {
         if keys::is_shift(vk) {
-            self.st.borrow_mut().shift.shift_down();
+            let repeat = lp & (1 << 30) != 0;
+            self.st.borrow_mut().shift.shift_down(repeat);
+            if !repeat {
+                debug::log("Shift 按下");
+            }
             return false;
         }
         self.st.borrow_mut().shift.other_key();
@@ -283,8 +310,14 @@ impl TextService_Impl {
 
     fn test_key_up(&self, ctx: Option<ITfContext>, vk: u32) -> bool {
         if keys::is_shift(vk) {
-            let tap = self.st.borrow_mut().shift.shift_up();
-            if tap {
+            let (desc, tap) = {
+                let mut st = self.st.borrow_mut();
+                let d = st.shift.describe();
+                (d, st.shift.shift_up())
+            };
+            let dup = self.recently_toggled();
+            debug::log(&format!("Shift 松开（按键接口）：{desc} → 算单按={tap} 刚切过={dup}"));
+            if tap && !dup {
                 self.shift_tap(ctx);
             }
             // Shift 松开永远交给程序
@@ -298,8 +331,36 @@ impl TextService_Impl {
         false
     }
 
+    fn recently_toggled(&self) -> bool {
+        self.st.borrow().last_toggle.is_some_and(|t| t.elapsed() < SAME_TAP)
+    }
+
+    /// 系统报告"单独按了一下 Shift"（保留键）。返回 true 表示切换了。
+    fn preserved_shift(&self, ctx: Option<ITfContext>) -> bool {
+        if self.recently_toggled() {
+            debug::log("Shift 松开（系统保留键）：刚切过，忽略");
+            return false;
+        }
+        let (desc, preview) = {
+            let mut st = self.st.borrow_mut();
+            let d = st.shift.describe();
+            let p = st.shift.preview();
+            // 这次按键由这里处理了：之后按键接口再报松开，不再算
+            st.shift.reset();
+            (d, p)
+        };
+        debug::log(&format!("Shift 松开（系统保留键）：{desc}"));
+        // 自己的检测看到了这次按下，而且看到中间点了鼠标或按了别的键：不算
+        if preview == Some(false) {
+            return false;
+        }
+        self.shift_tap(ctx);
+        true
+    }
+
     /// 单按一下 Shift：中文 ↔ 纯英文；在光标旁边闪一下"中"或"英"。
     fn shift_tap(&self, ctx: Option<ITfContext>) {
+        self.st.borrow_mut().last_toggle = Some(Instant::now());
         let composing = self.composing();
         if let Some(ctx) = &ctx {
             if !composing && self.in_game(ctx) {
@@ -318,12 +379,14 @@ impl TextService_Impl {
         }
         match self.call(&Request::Key { key: Key::ShiftTap, mods: Mods::default() }) {
             Some(Reply::KeyResult { commit, view, .. }) => {
+                debug::log(&format!("切换成 {}", if view.english_mode { "纯英文" } else { "中文" }));
                 let flash = if view.english_mode { "英" } else { "中" };
                 if let Some(ctx) = &ctx {
                     self.edit(ctx, Action::Update { commit, view, flash: Some(flash) }, false);
                 }
             }
             _ => {
+                debug::log("切换失败：连不上引擎");
                 if composing {
                     self.end_composition();
                 }
@@ -351,14 +414,26 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             || {
                 self.end_composition();
                 candwin::destroy();
-                let (tm, tid, cookie, key_sink) = {
+                let (tm, tid, cookie, key_sink, preserved) = {
                     let mut st = self.st.borrow_mut();
-                    (st.tm.take(), st.tid, st.tm_cookie.take(), std::mem::take(&mut st.key_sink))
+                    st.shift.reset();
+                    (
+                        st.tm.take(),
+                        st.tid,
+                        st.tm_cookie.take(),
+                        std::mem::take(&mut st.key_sink),
+                        std::mem::take(&mut st.preserved),
+                    )
                 };
                 if let Some(tm) = tm {
                     unsafe {
-                        if key_sink {
-                            if let Ok(km) = tm.cast::<ITfKeystrokeMgr>() {
+                        if let Ok(km) = tm.cast::<ITfKeystrokeMgr>() {
+                            if preserved {
+                                for (g, k) in preserved_keys() {
+                                    let _ = km.UnpreserveKey(&g, &k);
+                                }
+                            }
+                            if key_sink {
                                 let _ = km.UnadviseKeyEventSink(tid);
                             }
                         }
@@ -394,6 +469,15 @@ impl ITfTextInputProcessorEx_Impl for TextService_Impl {
                     let km: ITfKeystrokeMgr = tm.cast()?;
                     km.AdviseKeyEventSink(tid, &self.to_interface::<ITfKeyEventSink>(), true)?;
                     self.st.borrow_mut().key_sink = true;
+                    let desc: Vec<u16> = "中/英切换".encode_utf16().collect();
+                    let mut ok = 0;
+                    for (g, k) in preserved_keys() {
+                        if km.PreserveKey(tid, &g, &k, &desc).is_ok() {
+                            ok += 1;
+                        }
+                    }
+                    self.st.borrow_mut().preserved = ok > 0;
+                    debug::log(&format!("输入法激活；系统 Shift 检测登记了 {ok}/2 个"));
                     let src: ITfSource = tm.cast()?;
                     let cookie =
                         src.AdviseSink(&ITfThreadMgrEventSink::IID, &self.to_interface::<ITfThreadMgrEventSink>())?;
@@ -443,8 +527,12 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         Ok(true.into())
     }
 
-    fn OnPreservedKey(&self, _pic: Ref<ITfContext>, _rguid: *const GUID) -> Result<BOOL> {
-        Ok(false.into())
+    fn OnPreservedKey(&self, pic: Ref<ITfContext>, rguid: *const GUID) -> Result<BOOL> {
+        let ours = !rguid.is_null() && unsafe { *rguid == PRESERVE_SHIFT || *rguid == PRESERVE_SHIFT2 };
+        if !ours {
+            return Ok(false.into());
+        }
+        Ok(guard(|| self.preserved_shift(pic.cloned()), false).into())
     }
 }
 
