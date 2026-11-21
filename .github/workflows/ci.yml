@@ -91,20 +91,33 @@ jobs:
             if ($deps -match "(?i)vcruntime|msvcp|api-ms-win-crt") { throw "$f 依赖 VC++ 运行库" }
           }
 
-      - name: 注册、注销输入法 DLL
+      - name: 注册输入法 DLL
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $clsid = "{4D576843-6F05-43DC-B08F-FC06AE6D83F7}"
-          $tip = "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$clsid"
+          $tip = "HKLM:\SOFTWARE\Microsoft\CTF\TIP\{4D576843-6F05-43DC-B08F-FC06AE6D83F7}"
           $pairs = @(("$env:WINDIR\System32\regsvr32.exe", "target\x86_64-pc-windows-msvc\release\pinyin_tsf.dll"),
                      ("$env:WINDIR\SysWOW64\regsvr32.exe", "target\i686-pc-windows-msvc\release\pinyin_tsf.dll"))
           foreach ($p in $pairs) {
             $r = Start-Process $p[0] -ArgumentList "/s", (Resolve-Path $p[1]) -Wait -PassThru
             if ($r.ExitCode -ne 0) { throw "注册失败：$($p[1])（$($r.ExitCode)）" }
           }
-          if (-not (Test-Path $tip)) { throw "TSF 里没有登记" }
+          if (-not (Test-Path "$tip\LanguageProfile\0x00000804")) { throw "TSF 里没有登记" }
           Get-ChildItem $tip -Recurse | Out-Host
+
+      - name: 让 Windows 自己加载并激活输入法
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: bash
+        run: cargo test --release -p pinyin-tsf --test com -- --ignored --nocapture
+
+      - name: 注销输入法 DLL
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tip = "HKLM:\SOFTWARE\Microsoft\CTF\TIP\{4D576843-6F05-43DC-B08F-FC06AE6D83F7}"
+          $pairs = @(("$env:WINDIR\System32\regsvr32.exe", "target\x86_64-pc-windows-msvc\release\pinyin_tsf.dll"),
+                     ("$env:WINDIR\SysWOW64\regsvr32.exe", "target\i686-pc-windows-msvc\release\pinyin_tsf.dll"))
           foreach ($p in $pairs) {
             $r = Start-Process $p[0] -ArgumentList "/u", "/s", (Resolve-Path $p[1]) -Wait -PassThru
             if ($r.ExitCode -ne 0) { throw "注销失败：$($p[1])（$($r.ExitCode)）" }
