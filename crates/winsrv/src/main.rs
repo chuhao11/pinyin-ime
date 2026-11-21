@@ -112,7 +112,9 @@ fn listen(svc: Arc<Mutex<Service>>) -> std::io::Result<()> {
                 let svc = svc.clone();
                 std::thread::spawn(move || serve(conn, svc));
             }
-            Err(e) => return Err(e),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => return Err(e),
+            // 别的错误（比如程序连上又立刻断开）只影响那一个连接：稍等一下继续等下一个
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
         }
     }
 }

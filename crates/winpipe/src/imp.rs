@@ -194,11 +194,12 @@ impl PipeServer {
             )
         };
         if h.is_invalid() || h == INVALID_HANDLE_VALUE {
-            return Err(io::Error::other(if self.first {
-                "管道名已被占用（引擎已经在运行？）"
+            // 名字被占用用 AddrInUse 表示：引擎据此判断"已经有一个在跑"，直接退出；其他错误重试就行
+            return Err(if self.first {
+                io::Error::new(io::ErrorKind::AddrInUse, "管道名已被占用（引擎已经在运行？）")
             } else {
-                "建不了管道"
-            }));
+                io::Error::other("建不了管道")
+            });
         }
         self.first = false;
         if let Err(e) = unsafe { ConnectNamedPipe(h, None) } {

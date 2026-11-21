@@ -82,7 +82,6 @@ mod tests {
     use super::*;
     use crate::dict::{Dict, DictBuilder};
     use crate::userdb::UserDb;
-    use pinyin_ipc::{call, read_frame, write_frame};
     use pinyin_types::{Key, Mods};
 
     fn engine() -> Engine {
@@ -123,6 +122,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn over_a_real_socket() {
+        use pinyin_ipc::{call, read_frame, write_frame};
         use std::os::unix::net::UnixStream;
         let (mut a, mut b) = UnixStream::pair().unwrap();
         let t = std::thread::spawn(move || {
