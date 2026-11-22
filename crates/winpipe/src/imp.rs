@@ -3,8 +3,8 @@ use std::path::Path;
 
 use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
-    WAIT_OBJECT_0,
+    CloseHandle, GetLastError, LocalFree, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING,
+    ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
@@ -26,8 +26,9 @@ use windows::Win32::System::Pipes::{
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, WaitForSingleObject,
-    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    CreateEventW, CreateMutexW, GetCurrentProcess, OpenMutexW, OpenProcess, OpenProcessToken,
+    QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    SYNCHRONIZATION_SYNCHRONIZE,
 };
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
@@ -66,6 +67,53 @@ fn user_sid() -> io::Result<(String, Vec<u8>)> {
 /// 管道名：`\\.\pipe\PinyinIME-<当前用户 SID>`。
 pub fn pipe_name() -> io::Result<String> {
     Ok(format!(r"\\.\pipe\PinyinIME-{}", user_sid()?.0))
+}
+
+/// "引擎在运行"的标记（本次登录内、本用户）。
+fn engine_mark_name() -> io::Result<String> {
+    Ok(format!(r"Local\PinyinIME-engine-{}", user_sid()?.0))
+}
+
+/// 引擎占住"只能有一个引擎"的位置。拿着它直到退出。
+pub struct EngineLock(HANDLE);
+
+unsafe impl Send for EngineLock {}
+
+impl Drop for EngineLock {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+/// 引擎一启动就调用（在读词库之前）：已经有一个引擎在运行或正在启动，返回 None，这个应该马上退出。
+/// 开机时好几个程序可能同时帮忙启动引擎，这样只有一个真正读词库，其余的立刻退出。
+pub fn claim_engine() -> io::Result<Option<EngineLock>> {
+    let name = HSTRING::from(engine_mark_name()?);
+    unsafe {
+        let h = CreateMutexW(None, false, &name).map_err(win_err)?;
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let _ = CloseHandle(h);
+            return Ok(None);
+        }
+        Ok(Some(EngineLock(h)))
+    }
+}
+
+/// 引擎是不是已经在运行（或者正在启动）。只看标记，不连管道，不打扰引擎。
+pub fn engine_running() -> bool {
+    let Ok(name) = engine_mark_name() else { return true };
+    unsafe {
+        match OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(name)) {
+            Ok(h) => {
+                let _ = CloseHandle(h);
+                true
+            }
+            // 只有"没有这个标记"才算没运行；别的错误（没权限之类）当作在运行，不乱启动
+            Err(e) => e.code() != ERROR_FILE_NOT_FOUND.to_hresult(),
+        }
+    }
 }
 
 /// 一个连接（引擎那边是阻塞读写；DLL 那边带超时）。

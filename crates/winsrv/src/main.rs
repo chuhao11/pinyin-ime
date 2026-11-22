@@ -81,6 +81,14 @@ fn watch_settings(svc: Arc<Mutex<Service>>, path: PathBuf) {
 }
 
 fn main() {
+    // 只能有一个引擎：已经有一个在运行或正在启动（开机时好几个程序可能同时帮忙启动），这个马上退出，不去读词库
+    #[cfg(windows)]
+    let _only_one = match pinyin_winpipe::claim_engine() {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => std::process::exit(0),
+        // 查不了：照常启动（建管道时也会发现重复）
+        Err(_) => None,
+    };
     let user = pinyin_ipc::user_dir();
     let data = data_dir();
     let svc = match load(&data, &user) {

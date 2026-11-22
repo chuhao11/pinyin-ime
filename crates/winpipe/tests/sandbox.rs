@@ -1,6 +1,7 @@
 //! 管道的安全性（只在 Windows 上跑）：
 //! - 冒充引擎的程序连不上：管道另一头不是指定的引擎程序就不连
 //! - 商店应用沙箱里的程序能用输入法（连得上、能核对引擎身份），但开不了"分身"冒充引擎
+//! - 同时只能有一个引擎
 #![cfg(windows)]
 
 use std::io::{self, Read, Write};
@@ -79,6 +80,18 @@ fn refuses_a_pipe_run_by_some_other_program() {
     let e = connect_retry(&name, &notepad).err().expect("冒充的管道居然连上了");
     assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
     t.join().unwrap();
+}
+
+#[test]
+fn only_one_engine_at_a_time() {
+    // 测试时没有真的引擎在运行
+    assert!(!pinyin_winpipe::engine_running(), "测试前就有引擎在运行");
+    let first = pinyin_winpipe::claim_engine().unwrap().expect("第一个引擎应该占得到位置");
+    assert!(pinyin_winpipe::engine_running());
+    // 开机时好几个程序同时帮忙启动引擎：后来的那些马上退出
+    assert!(pinyin_winpipe::claim_engine().unwrap().is_none(), "第二个引擎应该退出");
+    drop(first);
+    assert!(!pinyin_winpipe::engine_running());
 }
 
 // ---------------- 商店应用沙箱 ----------------

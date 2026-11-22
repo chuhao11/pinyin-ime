@@ -22,7 +22,8 @@ use windows::Win32::System::Threading::{
 use super::register::dll_path;
 
 const TIMEOUT_MS: u32 = 300;
-const RETRY: Duration = Duration::from_secs(2);
+/// 连不上时隔多久再试（试一次很便宜：引擎不在时立刻失败）。短一点，引擎一启动好马上就能打字
+const RETRY: Duration = Duration::from_millis(300);
 const RELAUNCH: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
@@ -123,9 +124,19 @@ impl EngineClient {
         }
     }
 
+    /// 输入法刚在这个程序里激活（比如刚开机、刚登录）：引擎还没运行就马上启动它，不等第一次按键。
+    /// Windows 开机后要过十秒左右才运行"开机启动"的程序，不这样的话刚开机那几秒打不了字、按 Shift 没反应。
+    pub fn start_engine_if_needed(&mut self) {
+        self.launch_engine();
+    }
+
     /// 引擎没在运行：从安装目录启动一次（商店应用沙箱里启动不了，没关系，登录时会自动启动）。
+    /// 已经在运行或正在启动就不再启动。
     fn launch_engine(&mut self) {
         if self.launched.is_some_and(|t| t.elapsed() < RELAUNCH) {
+            return;
+        }
+        if pinyin_winpipe::engine_running() {
             return;
         }
         self.launched = Some(Instant::now());

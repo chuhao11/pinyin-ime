@@ -348,16 +348,11 @@ impl TextService_Impl {
         if self.ctx_dead(ctx) {
             return Kind::Off("刚试过这里开始不了输入");
         }
+        // 输入法被"关上"了（Ctrl+空格、程序关的，开机时系统有时也这样）：单按 Shift 能重新打开
+        if self.keyboard_closed() {
+            return Kind::Off("输入法被关上了（Ctrl+空格、程序或系统关的；单按 Shift 打开）");
+        }
         unsafe {
-            // 程序或用户关掉了输入法（Ctrl+空格、ImmSetOpenStatus）
-            let tm = self.st.borrow().tm.clone();
-            if let Some(tm) = tm {
-                if let Ok(m) = tm.cast::<ITfCompartmentMgr>() {
-                    if compartment(&m, &GUID_COMPARTMENT_KEYBOARD_OPENCLOSE) == Some(0) {
-                        return Kind::Off("输入法被关掉了（Ctrl+空格 或程序关的）");
-                    }
-                }
-            }
             // 程序禁用了输入法（很多游戏、密码框这样做）
             if let Ok(m) = ctx.cast::<ITfCompartmentMgr>() {
                 for g in [GUID_COMPARTMENT_KEYBOARD_DISABLED, GUID_COMPARTMENT_EMPTYCONTEXT] {
@@ -386,6 +381,28 @@ impl TextService_Impl {
             self.st.borrow_mut().field_cache = Some(FieldCheck { ctx: ctx.clone(), kind, at: Instant::now() });
         }
         kind
+    }
+
+    /// 输入法这会儿是不是被"关上"了（系统的开关，和我们自己的中/英不是一回事）：关着时按键全部原样输入。
+    fn keyboard_closed(&self) -> bool {
+        let tm = self.st.borrow().tm.clone();
+        tm.and_then(|tm| tm.cast::<ITfCompartmentMgr>().ok())
+            .is_some_and(|m| compartment(&m, &GUID_COMPARTMENT_KEYBOARD_OPENCLOSE) == Some(0))
+    }
+
+    /// 把输入法"打开"（激活时、用户单按 Shift 要中文时）。返回设置成功没有。
+    fn open_keyboard(&self) -> bool {
+        let (tm, tid) = {
+            let st = self.st.borrow();
+            (st.tm.clone(), st.tid)
+        };
+        let Some(tm) = tm else { return false };
+        unsafe {
+            tm.cast::<ITfCompartmentMgr>()
+                .ok()
+                .and_then(|m| m.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_OPENCLOSE).ok())
+                .is_some_and(|c| c.SetValue(tid, &VARIANT::from(1i32)).is_ok())
+        }
     }
 
     /// 告诉引擎现在是不是隐私输入框（状态变了、或者重新连上了引擎才发）。返回引擎知道了没有。
@@ -692,6 +709,30 @@ impl TextService_Impl {
     fn shift_tap(&self, ctx: Option<ITfContext>) {
         self.st.borrow_mut().last_toggle = Some(Instant::now());
         let composing = self.composing();
+        // 输入法被"关上"了（开机时系统有时这样，也可能是 Ctrl+空格 或程序关的）：这时打出来本来就是英文，
+        // 单按 Shift 就是要中文。把它打开、切到中文——不然屏幕上闪了"中"，打出来却还是英文
+        if !composing && self.keyboard_closed() {
+            let opened = self.open_keyboard();
+            let engine = matches!(self.call(&Request::SetEnglishMode { on: false }), Some(Reply::Ok));
+            debug::log(&format!("输入法原来是关上的：打开={opened}，引擎切到中文={engine}"));
+            // 在游戏里：就是要临时打中文
+            let game = ctx.as_ref().is_some_and(|c| self.in_game(c));
+            {
+                let mut st = self.st.borrow_mut();
+                st.field_cache = None;
+                st.last_block_log = None;
+                if game {
+                    st.game_chinese = true;
+                }
+                if let Some(ctx) = &ctx {
+                    st.ctx_marks.retain(|m| m.good || !same_ctx(&m.ctx, ctx));
+                }
+            }
+            if let Some(ctx) = &ctx {
+                self.edit(ctx, Action::Flash(if engine { "中" } else { "启动中" }), false);
+            }
+            return;
+        }
         if let Some(ctx) = &ctx {
             if !composing && self.in_game(ctx) {
                 // 游戏里：临时打开 / 关上中文，不动全局的中英状态
@@ -721,9 +762,14 @@ impl TextService_Impl {
                 }
             }
             _ => {
-                debug::log("切换失败：连不上引擎");
+                debug::log("切换失败：连不上引擎（可能还在启动）");
                 if composing {
                     self.end_composition();
+                }
+                // 刚开机引擎还在启动：告诉用户稍等，而不是什么反应都没有
+                self.st.borrow_mut().client.start_engine_if_needed();
+                if let Some(ctx) = &ctx {
+                    self.edit(ctx, Action::Flash("启动中"), false);
                 }
             }
         }
@@ -828,13 +874,12 @@ impl ITfTextInputProcessorEx_Impl for TextService_Impl {
                     let cookie =
                         src.AdviseSink(&ITfThreadMgrEventSink::IID, &self.to_interface::<ITfThreadMgrEventSink>())?;
                     self.st.borrow_mut().tm_cookie = Some(cookie);
-                    // 打开输入法（和微软的示例一样）；程序或 Ctrl+空格 可以再关掉
-                    if let Ok(m) = tm.cast::<ITfCompartmentMgr>() {
-                        if let Ok(c) = m.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_OPENCLOSE) {
-                            let _ = c.SetValue(tid, &VARIANT::from(1i32));
-                        }
-                    }
                 }
+                // 打开输入法（和微软的示例一样）；程序或 Ctrl+空格 可以再关掉，单按 Shift 又能打开
+                let opened = self.open_keyboard();
+                debug::log(&format!("打开输入法={opened}，现在关着={}", self.keyboard_closed()));
+                // 刚开机、刚登录时引擎可能还没运行：现在就启动，不等第一次按键
+                self.st.borrow_mut().client.start_engine_if_needed();
                 Ok(())
             },
             Ok(()),
