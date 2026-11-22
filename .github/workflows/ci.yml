@@ -11,6 +11,11 @@ permissions:
 jobs:
   test:
     name: ${{ matrix.os }}
+    # 生成"这个安装程序是本仓库 GitHub 编译的"证明要用（只用于这一件事）
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -43,11 +48,15 @@ jobs:
         shell: bash
         run: |
           cargo fmt --all --check
-          cargo clippy --release --workspace --all-targets -- -D warnings
+          cargo clippy --locked --release --workspace --all-targets -- -D warnings
+
+      - name: 安全检查：只用审查过的依赖，源码里没有联网、剪贴板、动态加载
+        shell: bash
+        run: tools/check-safety.sh
 
       - name: 编译词库
         shell: bash
-        run: cargo run --release -p dictgen
+        run: cargo run --locked --release -p dictgen
 
       - name: 下载语言模型（本仓库 Releases，核对校验码）
         shell: bash
@@ -59,17 +68,22 @@ jobs:
         shell: bash
         env:
           REQUIRE_DICT: "1"
-        run: cargo test --release --workspace -- --nocapture
+        run: cargo test --locked --release --workspace -- --nocapture
 
       # ---------------- 下面只在 Windows 上：编译、检查、打包安装程序 ----------------
+
+      - name: 安全测试：商店应用沙箱里能用输入法，但冒充不了引擎
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cargo test --locked --release -p pinyin-winpipe --test sandbox -- --ignored --nocapture --test-threads=1
 
       - name: 编译 Windows 程序（引擎、设置页、64 位和 32 位输入法 DLL）
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          cargo build --release -p pinyin-winsrv -p pinyin-settings
-          cargo build --release -p pinyin-tsf --target x86_64-pc-windows-msvc
-          cargo build --release -p pinyin-tsf --target i686-pc-windows-msvc
+          cargo build --locked --release -p pinyin-winsrv -p pinyin-settings
+          cargo build --locked --release -p pinyin-tsf --target x86_64-pc-windows-msvc
+          cargo build --locked --release -p pinyin-tsf --target i686-pc-windows-msvc
 
       - name: 检查 DLL 的入口名和依赖（不依赖 VC++ 运行库）
         if: runner.os == 'Windows'
@@ -91,6 +105,40 @@ jobs:
             if ($deps -match "(?i)vcruntime|msvcp|api-ms-win-crt") { throw "$f 依赖 VC++ 运行库" }
           }
 
+      - name: 安全检查：程序文件里没有联网、没有剪贴板
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products * -find "VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          $files = "target\x86_64-pc-windows-msvc\release\pinyin_tsf.dll", "target\i686-pc-windows-msvc\release\pinyin_tsf.dll",
+                   "target\release\pinyin-engine.exe", "target\release\pinyin-settings.exe"
+          # 能联网的系统模块
+          $net = "ws2_32", "wsock32", "mswsock", "winhttp", "wininet", "urlmon", "dnsapi", "iphlpapi", "webio", "httpapi",
+                 "websocket", "winnsi", "netapi32", "mpr", "rasapi32", "qmgr", "bitsproxy"
+          # 剪贴板接口（读、写、监视剪贴板）
+          $clip = "OpenClipboard", "GetClipboardData", "SetClipboardData", "EmptyClipboard", "AddClipboardFormatListener",
+                  "SetClipboardViewer", "GetClipboardSequenceNumber", "GetClipboardOwner", "EnumClipboardFormats",
+                  "IsClipboardFormatAvailable", "CountClipboardFormats", "GetOpenClipboardWindow", "GetUpdatedClipboardFormats",
+                  "GetPriorityClipboardFormat", "OleGetClipboard", "OleSetClipboard", "OleFlushClipboard"
+          # 用名字动态调用的系统功能（联网、剪贴板）
+          $winrt = "Windows.Networking", "Windows.Web.Http", "Windows.ApplicationModel.DataTransfer"
+          foreach ($f in $files) {
+            $imports = & $dumpbin /nologo /imports $f | Out-String
+            foreach ($d in $net) { if ($imports -match "(?im)^\s+$d\.dll") { throw "$f 用了联网模块 $d.dll" } }
+            foreach ($c in $clip) { if ($imports -match "\b$c\b") { throw "$f 用了剪贴板接口 $c" } }
+            # 程序里有没有藏着这些名字（不经过导入表、运行时才加载的那种）：按 ASCII 和 UTF-16 都找
+            $bytes = [IO.File]::ReadAllBytes((Resolve-Path $f))
+            $texts = @([Text.Encoding]::ASCII.GetString($bytes),
+                       [Text.Encoding]::Unicode.GetString($bytes),
+                       [Text.Encoding]::Unicode.GetString($bytes, 1, $bytes.Length - 1))
+            foreach ($t in $texts) {
+              foreach ($d in $net) { if ($t -match "(?i)\b$d\.dll") { throw "$f 里有联网模块的名字 $d.dll" } }
+              foreach ($c in $clip + $winrt) { if ($t.Contains($c)) { throw "$f 里有 $c" } }
+            }
+            Write-Host "✓ $f：不联网、不碰剪贴板"
+          }
+
       - name: 注册输入法 DLL
         if: runner.os == 'Windows'
         shell: pwsh
@@ -109,7 +157,7 @@ jobs:
         if: runner.os == 'Windows'
         continue-on-error: true
         shell: bash
-        run: cargo test --release -p pinyin-tsf --test com -- --ignored --nocapture
+        run: cargo test --locked --release -p pinyin-tsf --test com -- --ignored --nocapture
 
       - name: 注销输入法 DLL
         if: runner.os == 'Windows'
@@ -146,6 +194,14 @@ jobs:
           & $iscc /Q "/DAppVer=0.1.${{ github.run_number }}" installer\pinyin.iss
           if ($LASTEXITCODE -ne 0) { throw "生成安装程序失败" }
           Get-ChildItem dist\*.exe | Out-Host
+
+      # 证明"这个安装程序是本仓库在 GitHub 上编译的"：
+      # gh attestation verify PinyinIME-Setup-x.exe -R chuhao11/pinyin-ime
+      - name: 生成安装程序的来源证明
+        if: runner.os == 'Windows' && github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/PinyinIME-Setup-*.exe
 
       - name: 试装、检查、再卸载（在 CI 的虚拟机里）
         if: runner.os == 'Windows'

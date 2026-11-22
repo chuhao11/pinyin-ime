@@ -1,0 +1,47 @@
+# 发出去的程序（输入法 DLL、引擎、设置页）用到的全部第三方代码（包括编译时用的）。
+# tools/check-safety.sh 会核对：多了任何一个没在这里的，编译就失败。
+# 加新依赖之前先审查：它是谁写的、做什么、会不会联网/收集数据/碰剪贴板，审查过了再加到这里。
+#
+# 我们自己的
+pinyin-engine
+pinyin-ipc
+pinyin-settings
+pinyin-tsf
+pinyin-types
+pinyin-winpipe
+pinyin-winsrv
+# 微软官方的 Windows 接口（windows-rs）
+windows
+windows-collections
+windows-core
+windows-future
+windows-implement
+windows-interface
+windows-link
+windows-numerics
+windows-result
+windows-strings
+windows-threading
+# 生成 windows-rs 接口代码用的（只在编译时运行）
+proc-macro2
+quote
+syn
+unicode-ident
+# SQLite 数据库（存你的记忆），从源码编译进程序；以及它用到的小工具库
+rusqlite
+libsqlite3-sys
+bitflags
+fallible-iterator
+fallible-streaming-iterator
+foldhash
+hashbrown
+hashlink
+smallvec
+# 编译 SQLite 源码用的（只在编译时运行）
+cc
+find-msvc-tools
+pkg-config
+shlex
+vcpkg
+# 只读方式打开词库文件
+memmap2

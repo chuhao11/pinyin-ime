@@ -30,6 +30,14 @@ pub struct EngineClient {
     conn: Option<PipeConn>,
     next_try: Option<Instant>,
     launched: Option<Instant>,
+    /// 第几次连上（每次重连，引擎那边都是一个全新的状态）
+    generation: u64,
+}
+
+/// 安装目录里的引擎：和这个 DLL 放在一起。只连它。
+fn engine_path() -> std::path::PathBuf {
+    let dll = dll_path();
+    std::path::Path::new(&dll).parent().map(|d| d.join("pinyin-engine.exe")).unwrap_or_default()
 }
 
 impl EngineClient {
@@ -57,19 +65,29 @@ impl EngineClient {
         self.conn = None;
     }
 
+    /// 第几次连上：变了说明引擎那边是全新的状态，要重新告诉它这个输入框的情况。
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     fn try_connect(&mut self) {
         if self.next_try.is_some_and(|t| Instant::now() < t) {
             return;
         }
         self.next_try = Some(Instant::now() + RETRY);
-        match pinyin_winpipe::connect(TIMEOUT_MS) {
+        match pinyin_winpipe::connect(TIMEOUT_MS, &engine_path()) {
             Ok(mut c) => {
                 let pid = unsafe { GetCurrentProcessId() };
                 if let Ok(Reply::Hello { proto }) = call(&mut c, &Request::Hello { proto: PROTO, pid }) {
                     if proto == PROTO {
                         self.conn = Some(c);
+                        self.generation += 1;
                     }
                 }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                // 有别的程序冒充引擎：不连，按键一个都不发
+                super::debug::log(&format!("不连引擎：{e}"));
             }
             Err(_) => self.launch_engine(),
         }
@@ -114,9 +132,7 @@ impl EngineClient {
         if !Self::normal_process() {
             return;
         }
-        let dll = dll_path();
-        let Some(dir) = std::path::Path::new(&dll).parent() else { return };
-        let exe = dir.join("pinyin-engine.exe");
+        let exe = engine_path();
         if !exe.exists() {
             return;
         }

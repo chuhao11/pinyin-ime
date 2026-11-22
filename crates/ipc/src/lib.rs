@@ -15,7 +15,8 @@ pub use pinyin_types;
 
 /// 协议版本：两边不一致时 DLL 不用引擎（原样放过按键），不会出怪事。
 /// 2：候选窗多了"按了一下 `，再按就删"的标记
-pub const PROTO: u32 = 2;
+/// 3：隐私输入框（SetPrivate）
+pub const PROTO: u32 = 3;
 /// 一条消息最长多少字节。
 pub const MAX_FRAME: usize = 256 * 1024;
 const MAX_STR: usize = 16 * 1024;
@@ -51,6 +52,10 @@ pub enum Request {
     /// 多音字可以写成 词语(pin yin)
     AddWords {
         text: String,
+    },
+    /// 现在的输入框是不是隐私输入框（浏览器无痕窗口等）：是的话照常打字，但什么都不记
+    SetPrivate {
+        on: bool,
     },
 }
 
@@ -282,6 +287,10 @@ impl Request {
                 e.u8(9);
                 e.str(text);
             }
+            Request::SetPrivate { on } => {
+                e.u8(10);
+                e.bool(*on);
+            }
         }
         e.0
     }
@@ -298,6 +307,7 @@ impl Request {
             7 => Request::ReloadSettings,
             8 => Request::SetEnglishMode { on: d.bool()? },
             9 => Request::AddWords { text: d.str()? },
+            10 => Request::SetPrivate { on: d.bool()? },
             _ => return Err(DecodeError("请求类型不对")),
         };
         d.done()?;
@@ -491,6 +501,8 @@ mod tests {
             Request::ReloadSettings,
             Request::SetEnglishMode { on: true },
             Request::AddWords { text: "张子涵，螺蛳粉 曾经(zeng jing)".into() },
+            Request::SetPrivate { on: true },
+            Request::SetPrivate { on: false },
         ]
     }
 

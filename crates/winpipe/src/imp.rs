@@ -1,31 +1,43 @@
 use std::io;
+use std::path::Path;
 
-use windows::core::{HSTRING, PCWSTR, PWSTR};
+use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE,
-    HLOCAL, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    CloseHandle, GetLastError, LocalFree, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SetSecurityInfo, SDDL_REVISION_1,
     SE_KERNEL_OBJECT,
 };
 use windows::Win32::Security::{
-    EqualSid, GetTokenInformation, TokenUser, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    EqualSid, GetSecurityDescriptorDacl, GetTokenInformation, TokenUser, ACL, DACL_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_FIRST_PIPE_INSTANCE,
-    FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION,
-    SECURITY_SQOS_PRESENT,
+    CreateFileW, FlushFileBuffers, GetFileInformationByHandle, ReadFile, WriteFile, BY_HANDLE_FILE_INFORMATION,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_NONE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
 };
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
-use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcess, OpenProcessToken, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, WaitForSingleObject,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 const BUF: u32 = 64 * 1024;
+
+/// 连接的一方能有的权限：读写数据、读属性，但**没有"再开一个管道实例"**
+/// （FILE_CREATE_PIPE_INSTANCE，数值上和 FILE_APPEND_DATA 一样）。
+/// = FILE_GENERIC_READ | FILE_GENERIC_WRITE 去掉 FILE_APPEND_DATA。
+/// 商店应用沙箱只给这些：沙箱里的程序能用输入法，但开不了"分身"冒充引擎。
+pub const CLIENT_ACCESS: u32 = 0x0012_019B;
 
 fn win_err(e: windows::core::Error) -> io::Error {
     io::Error::other(e.to_string())
@@ -154,9 +166,16 @@ impl Drop for PipeServer {
 
 impl PipeServer {
     pub fn new() -> io::Result<PipeServer> {
+        Self::named(&pipe_name()?)
+    }
+
+    /// 用指定的管道名（测试用）。
+    pub fn named(name: &str) -> io::Result<PipeServer> {
         let (sid, _) = user_sid()?;
-        // 当前用户、系统：全部权限；商店应用沙箱：读写；低完整性：沙箱里的程序也能连
-        let sddl = format!("D:P(A;;GA;;;{sid})(A;;GA;;;SY)(A;;GRGW;;;AC)(A;;GRGW;;;S-1-15-2-2)S:(ML;;NW;;;LW)");
+        // 当前用户、系统：全部权限；商店应用沙箱：只能读写数据，不能开新实例；低完整性：沙箱里的程序也能连
+        let sddl = format!(
+            "D:P(A;;GA;;;{sid})(A;;GA;;;SY)(A;;{CLIENT_ACCESS:#x};;;AC)(A;;{CLIENT_ACCESS:#x};;;S-1-15-2-2)S:(ML;;NW;;;LW)"
+        );
         let mut sd = PSECURITY_DESCRIPTOR::default();
         unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -167,7 +186,7 @@ impl PipeServer {
             )
             .map_err(win_err)?;
         }
-        Ok(PipeServer { name: HSTRING::from(pipe_name()?.as_str()), sd, first: true })
+        Ok(PipeServer { name: HSTRING::from(name), sd, first: true })
     }
 
     /// 等一个 DLL 连进来。
@@ -214,15 +233,21 @@ impl PipeServer {
     }
 }
 
-/// DLL 这边：连上引擎。连上后核对管道的所有者是不是当前用户。
-pub fn connect(timeout_ms: u32) -> io::Result<PipeConn> {
+/// DLL 这边：连上引擎。`engine` 是安装目录里的 pinyin-engine.exe：
+/// 管道另一头必须正是这个程序，而且管道的所有者是当前用户，否则不连（按键一个都不发）。
+pub fn connect(timeout_ms: u32, engine: &Path) -> io::Result<PipeConn> {
+    connect_named(&pipe_name()?, timeout_ms, engine)
+}
+
+/// 同 [`connect`]，用指定的管道名（测试用）。
+pub fn connect_named(name: &str, timeout_ms: u32, engine: &Path) -> io::Result<PipeConn> {
     let (_, my_sid) = user_sid()?;
-    let name = HSTRING::from(pipe_name()?.as_str());
+    let name = HSTRING::from(name);
     let flags = FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION;
     let h = unsafe {
         CreateFileW(
             PCWSTR(name.as_ptr()),
-            GENERIC_READ.0 | GENERIC_WRITE.0,
+            CLIENT_ACCESS,
             FILE_SHARE_NONE,
             None,
             OPEN_EXISTING,
@@ -252,10 +277,128 @@ pub fn connect(timeout_ms: u32) -> io::Result<PipeConn> {
         }
         same
     };
-    let event = unsafe { CreateEventW(None, true, false, PCWSTR::null()).map_err(win_err)? };
+    let event = unsafe { CreateEventW(None, true, false, PCWSTR::null()) };
+    let event = match event {
+        Ok(e) => e,
+        Err(e) => {
+            unsafe {
+                let _ = CloseHandle(h);
+            }
+            return Err(win_err(e));
+        }
+    };
     let conn = PipeConn { h, timeout_ms: timeout_ms.max(1), event, server: false };
     if !ok {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "管道不是本人创建的，不连"));
     }
+    // 同一个用户的别的程序也能建同名的管道冒充引擎：核对另一头真的是安装目录里的引擎
+    if !server_is(h, engine) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "管道另一头不是输入法引擎，不连"));
+    }
     Ok(conn)
+}
+
+/// 管道另一头（建这个管道实例的程序）是不是 `engine` 这个文件。
+fn server_is(h: HANDLE, engine: &Path) -> bool {
+    match server_image(h) {
+        Some(image) => same_file(&image, engine),
+        None => false,
+    }
+}
+
+/// 管道另一头那个程序的完整路径。
+fn server_image(h: HANDLE) -> Option<std::path::PathBuf> {
+    unsafe {
+        let mut pid = 0u32;
+        GetNamedPipeServerProcessId(h, &mut pid).ok()?;
+        if pid == 0 {
+            return None;
+        }
+        let p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = vec![0u16; 2048];
+        let mut len = buf.len() as u32;
+        let r = QueryFullProcessImageNameW(p, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len);
+        let _ = CloseHandle(p);
+        r.ok()?;
+        Some(String::from_utf16_lossy(&buf[..len as usize]).into())
+    }
+}
+
+/// 两个路径是不是同一个文件：先比路径（不分大小写），不一样再比文件编号（同一个文件换了写法也认得出）。
+fn same_file(a: &Path, b: &Path) -> bool {
+    if a.as_os_str().to_string_lossy().to_lowercase() == b.as_os_str().to_string_lossy().to_lowercase() {
+        return true;
+    }
+    match (file_id(a), file_id(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// 文件所在的卷和文件编号。
+fn file_id(p: &Path) -> Option<(u32, u32, u32)> {
+    unsafe {
+        let h = CreateFileW(
+            &HSTRING::from(p.as_os_str()),
+            FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+        .ok()?;
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        let r = GetFileInformationByHandle(h, &mut info);
+        let _ = CloseHandle(h);
+        r.ok()?;
+        Some((info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow))
+    }
+}
+
+/// 引擎启动时调用：让商店应用沙箱里的输入法也能查到"引擎是哪个程序"（只能查名字，别的什么都做不了），
+/// 这样它们也能核对引擎的身份。没有这一步，沙箱里打不了中文。
+pub fn allow_sandboxed_lookup() -> io::Result<()> {
+    unsafe {
+        let me = GetCurrentProcess();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetSecurityInfo(me, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, None, None, None, None, Some(&mut sd))
+            .ok()
+            .map_err(win_err)?;
+        let mut s = PWSTR::null();
+        let conv = ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            sd,
+            SDDL_REVISION_1,
+            DACL_SECURITY_INFORMATION,
+            &mut s,
+            None,
+        );
+        LocalFree(Some(HLOCAL(sd.0)));
+        conv.map_err(win_err)?;
+        let text = s.to_string().unwrap_or_default();
+        LocalFree(Some(HLOCAL(s.0.cast())));
+        // 没有访问控制（谁都能查）就不用加
+        if !text.starts_with("D:") || text.contains("NO_ACCESS_CONTROL") {
+            return Ok(());
+        }
+        // 0x1000 = PROCESS_QUERY_LIMITED_INFORMATION：只能查程序路径、是否还在运行
+        let new = format!("{text}(A;;0x1000;;;AC)(A;;0x1000;;;S-1-15-2-2)");
+        let mut nsd = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(&HSTRING::from(new), SDDL_REVISION_1, &mut nsd, None)
+            .map_err(win_err)?;
+        let mut present = BOOL::default();
+        let mut defaulted = BOOL::default();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let r = match GetSecurityDescriptorDacl(nsd, &mut present, &mut dacl, &mut defaulted) {
+            Ok(()) if present.as_bool() && !dacl.is_null() => {
+                SetSecurityInfo(me, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, None, None, Some(dacl), None)
+                    .ok()
+                    .map_err(win_err)
+            }
+            Ok(()) => Err(io::Error::other("权限表是空的")),
+            Err(e) => Err(win_err(e)),
+        };
+        LocalFree(Some(HLOCAL(nsd.0)));
+        r
+    }
 }

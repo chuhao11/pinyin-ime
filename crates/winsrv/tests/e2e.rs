@@ -33,7 +33,7 @@ fn connect(_sock: &std::path::Path) -> Option<Conn> {
         #[cfg(unix)]
         let c = std::os::unix::net::UnixStream::connect(_sock).ok();
         #[cfg(windows)]
-        let c = pinyin_winpipe::connect(5000).ok();
+        let c = pinyin_winpipe::connect(5000, std::path::Path::new(env!("CARGO_BIN_EXE_pinyin-engine"))).ok();
         if c.is_some() {
             return c;
         }

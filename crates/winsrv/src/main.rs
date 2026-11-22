@@ -104,6 +104,8 @@ fn main() {
 
 #[cfg(windows)]
 fn listen(svc: Arc<Mutex<Service>>) -> std::io::Result<()> {
+    // 让商店应用沙箱里的输入法也能核对"另一头是不是真的引擎"（只开放查程序路径）
+    let _ = pinyin_winpipe::allow_sandboxed_lookup();
     // 第一次建管道用"第一个实例"：已经有一个引擎在跑（或者名字被别人占了），这里就退出
     let mut server = pinyin_winpipe::PipeServer::new()?;
     loop {

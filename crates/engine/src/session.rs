@@ -89,6 +89,8 @@ pub struct Session {
     sq_open: bool,
     /// 按了一下 ` 的词：再按一下就删掉它
     armed: Option<String>,
+    /// 隐私输入框（浏览器的无痕窗口、要求"别记住"的输入框）：照常打字，但什么都不记
+    private: bool,
 }
 
 impl Session {
@@ -98,6 +100,15 @@ impl Session {
 
     pub fn is_composing(&self) -> bool {
         !self.input.is_empty()
+    }
+
+    /// 打开/关上隐私模式：打开时照常打字，但不学习、不往硬盘写任何东西（上文只在内存里，照常用）。
+    pub fn set_private(&mut self, on: bool) {
+        self.private = on;
+    }
+
+    pub fn is_private(&self) -> bool {
+        self.private
     }
 
     pub fn candidates(&self) -> &[Candidate] {
@@ -570,6 +581,9 @@ impl Engine {
 
     /// 你选的多字词不是"本来该排第一"的那个：给那个词记一次冷落（单字不算）。
     fn note_rejection(&mut self, s: &Session, chosen: &Candidate) {
+        if s.private {
+            return;
+        }
         let now = self.now();
         // 纠错的候选排在前面，你却选了原样拼写的：记住"这样打不是打错"，以后这个纠错不再排前面
         if chosen.fixes.is_empty() {
@@ -637,6 +651,24 @@ impl Engine {
         // 个别几类记录按时间清理（一天最多一次）
         self.user.maybe_maintain(&self.dict, now);
         let mut text: String = s.selected.iter().map(|x| x.text.as_str()).collect();
+        // 隐私输入框（无痕窗口等）：什么都不记
+        if !s.private {
+            self.learn_from(s, &text, now);
+        }
+        // 记下上文给下一次输入用；后面跟了符号就算断句
+        s.ctx = match (&extra, s.selected.last().and_then(|x| x.last_lm)) {
+            (None, Some(id)) => Some((id, now)),
+            _ => None,
+        };
+        if let Some(e) = extra {
+            text.push_str(&e);
+        }
+        s.reset();
+        Response { consumed: true, commit: Some(text) }
+    }
+
+    /// 记住这次上屏用到的词、搭配、纠错、英文词。
+    fn learn_from(&mut self, s: &Session, text: &str, now: i64) {
         // 前后词关联：记住"上一个词后面选了什么"（上一次上屏的词，以及这次分几段选的前后两段）
         if let Some(lm) = &self.lm {
             let mut prev = s.ctx.filter(|&(_, t)| now - t <= CONTEXT_SECS).map(|(id, _)| id);
@@ -676,19 +708,9 @@ impl Engine {
             let n = text.chars().count();
             if (2..=8).contains(&n) {
                 let code: Vec<u16> = s.selected.iter().flat_map(|x| x.code.iter().copied()).collect();
-                self.user.learn(&self.dict, &code, &text, now);
+                self.user.learn(&self.dict, &code, text, now);
             }
         }
-        // 记下上文给下一次输入用；后面跟了符号就算断句
-        s.ctx = match (&extra, s.selected.last().and_then(|x| x.last_lm)) {
-            (None, Some(id)) => Some((id, now)),
-            _ => None,
-        };
-        if let Some(e) = extra {
-            text.push_str(&e);
-        }
-        s.reset();
-        Response { consumed: true, commit: Some(text) }
     }
 
     /// 按了符号（或者没有候选时按空格）：先上屏高亮的候选，再输出符号。
@@ -828,6 +850,10 @@ impl Ime {
 
     pub fn clear_context(&mut self) {
         self.session.clear_context();
+    }
+
+    pub fn set_private(&mut self, on: bool) {
+        self.session.set_private(on);
     }
 
     pub fn set_clock(&mut self, f: impl Fn() -> i64 + Send + 'static) {
@@ -1124,6 +1150,35 @@ mod tests {
         // 下次直接排第一
         typ(&mut m, "zhangzihan");
         assert_eq!(m.view().items[0], "张子涵");
+    }
+
+    #[test]
+    fn private_box_types_normally_but_remembers_nothing() {
+        let mut m = ime();
+        m.set_private(true);
+        let before = m.user().record_count();
+        // 选字组人名、选第二个候选（冷落首选）、选单字：平时都会记下来
+        typ(&mut m, "zhangzihan");
+        let pick = |m: &mut Ime, t: &str| {
+            let i = m.candidates().iter().position(|c| c.text == t).unwrap();
+            m.process_key(Key::Char(char::from(b'1' + i as u8)), Mods::default())
+        };
+        pick(&mut m, "张");
+        pick(&mut m, "子");
+        assert_eq!(pick(&mut m, "涵").commit.as_deref(), Some("张子涵"));
+        assert_eq!(typ(&mut m, "shi2"), "事");
+        assert_eq!(typ(&mut m, "nihao "), "你好");
+        assert_eq!(m.user().record_count(), before, "隐私输入框里什么都不该记");
+        typ(&mut m, "zhangzihan");
+        assert!(!m.view().items.contains(&"张子涵".to_string()));
+        key(&mut m, Key::Escape);
+        // 离开隐私输入框：照常学习
+        m.set_private(false);
+        typ(&mut m, "zhangzihan");
+        pick(&mut m, "张");
+        pick(&mut m, "子");
+        pick(&mut m, "涵");
+        assert!(m.user().record_count() > before);
     }
 
     #[test]

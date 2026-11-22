@@ -347,6 +347,17 @@ impl UserDb {
         self.entries.is_empty()
     }
 
+    /// 记住的东西一共有几条（词、单字、搭配、纠错、英文词、冷落记录）。
+    pub fn record_count(&self) -> usize {
+        self.entries.len()
+            + self.fixes.len()
+            + self.en.len()
+            + self.rejects.len()
+            + self.fix_rejects.len()
+            + self.chars.len()
+            + self.pairs.len()
+    }
+
     /// 写盘失败的次数（不让它影响打字，只记下来）。
     pub fn write_errors(&self) -> u64 {
         self.write_errors

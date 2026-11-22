@@ -15,11 +15,11 @@ use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::TextServices::{
     ITfComposition, ITfCompositionSink, ITfContext, ITfContextComposition, ITfEditSession, ITfEditSession_Impl,
-    ITfInputScope, ITfInsertAtSelection, ITfRange, InputScope, GUID_PROP_INPUTSCOPE, IS_ALPHANUMERIC_PIN,
-    IS_ALPHANUMERIC_PIN_SET, IS_DIGITS, IS_NUMBER, IS_NUMERIC_PASSWORD, IS_NUMERIC_PIN, IS_PASSWORD, TF_AE_NONE,
-    TF_ANCHOR_END, TF_DEFAULT_SELECTION, TF_ES_ASYNC, TF_ES_READ, TF_IAS_NOQUERY, TF_IAS_QUERYONLY, TF_SELECTION,
-    TF_SELECTIONSTYLE,
+    ITfInputScope, ITfInsertAtSelection, ITfRange, InputScope, GUID_PROP_INPUTSCOPE, TF_AE_NONE, TF_ANCHOR_END,
+    TF_DEFAULT_SELECTION, TF_ES_ASYNC, TF_ES_READ, TF_IAS_NOQUERY, TF_IAS_QUERYONLY, TF_SELECTION, TF_SELECTIONSTYLE,
 };
+
+use crate::fields::{self, Kind};
 use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetGUIThreadInfo, GUITHREADINFO};
 
 use super::candwin;
@@ -33,7 +33,7 @@ pub enum Action {
     End(ITfComposition),
     /// 在光标旁边闪一下"中"/"英"
     Flash(&'static str),
-    /// 只读：光标所在的是不是密码框、数字框（结果放在 `result`）
+    /// 只读：光标所在的是哪种输入框（密码框、数字框、隐私输入框……结果放在 `kind`）
     CheckScope,
     /// 只读：程序排好版以后，把候选窗挪到正确的位置
     Reposition,
@@ -44,25 +44,15 @@ pub struct EditSession {
     ctx: ITfContext,
     svc: ComObject<TextService>,
     pub action: Action,
-    pub result: Cell<bool>,
     /// 程序已经执行了这次会话（同步请求时，请求返回前就知道）
     pub ran: Cell<bool>,
+    /// CheckScope 的结果
+    pub kind: Cell<Kind>,
 }
 
 fn utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
-
-/// 密码、PIN、纯数字的输入框：输入法不工作。
-const BLOCKED_SCOPES: [InputScope; 7] = [
-    IS_PASSWORD,
-    IS_NUMERIC_PASSWORD,
-    IS_NUMERIC_PIN,
-    IS_ALPHANUMERIC_PIN,
-    IS_ALPHANUMERIC_PIN_SET,
-    IS_DIGITS,
-    IS_NUMBER,
-];
 
 /// 程序没给出文字位置时的退路：系统光标的位置，再不行就是鼠标位置。
 fn fallback_rect() -> RECT {
@@ -82,7 +72,7 @@ fn fallback_rect() -> RECT {
 
 impl EditSession {
     pub fn new(ctx: ITfContext, svc: ComObject<TextService>, action: Action) -> Self {
-        EditSession { ctx, svc, action, result: Cell::new(false), ran: Cell::new(false) }
+        EditSession { ctx, svc, action, ran: Cell::new(false), kind: Cell::new(Kind::Normal) }
     }
 
     fn start_composition(&self, ec: u32) -> Result<ITfComposition> {
@@ -231,23 +221,22 @@ impl EditSession {
         }
     }
 
-    /// 光标处的输入框是不是密码框、数字框。
-    fn blocked_scope(&self, ec: u32) -> bool {
+    /// 光标处的输入框声明的类型（密码框、数字框、隐私输入框……见 fields.rs）。
+    fn field_kind(&self, ec: u32) -> Kind {
         unsafe {
-            let Some(range) = self.selection_range(ec) else { return false };
-            let Ok(prop) = self.ctx.GetAppProperty(&GUID_PROP_INPUTSCOPE) else { return false };
-            let Ok(v) = prop.GetValue(ec, &range) else { return false };
-            let Ok(unk) = IUnknown::try_from(&v) else { return false };
-            let Ok(is) = unk.cast::<ITfInputScope>() else { return false };
+            let Some(range) = self.selection_range(ec) else { return Kind::Normal };
+            let Ok(prop) = self.ctx.GetAppProperty(&GUID_PROP_INPUTSCOPE) else { return Kind::Normal };
+            let Ok(v) = prop.GetValue(ec, &range) else { return Kind::Normal };
+            let Ok(unk) = IUnknown::try_from(&v) else { return Kind::Normal };
+            let Ok(is) = unk.cast::<ITfInputScope>() else { return Kind::Normal };
             let mut p: *mut InputScope = std::ptr::null_mut();
             let mut n = 0u32;
             if is.GetInputScopes(&mut p, &mut n).is_err() || p.is_null() {
-                return false;
+                return Kind::Normal;
             }
-            let scopes = std::slice::from_raw_parts(p, n as usize);
-            let blocked = scopes.iter().any(|s| BLOCKED_SCOPES.contains(s));
+            let scopes: Vec<i32> = std::slice::from_raw_parts(p, n as usize).iter().map(|s| s.0).collect();
             CoTaskMemFree(Some(p as *const _));
-            blocked
+            fields::classify(&scopes)
         }
     }
 
@@ -256,7 +245,7 @@ impl EditSession {
             Action::Update { commit, view, flash } => self.update(ec, commit, view, *flash)?,
             Action::End(comp) => self.end(ec, comp),
             Action::Flash(t) => self.flash(ec, t),
-            Action::CheckScope => self.result.set(self.blocked_scope(ec)),
+            Action::CheckScope => self.kind.set(self.field_kind(ec)),
             Action::Reposition => {
                 if let Some(comp) = self.svc.composition() {
                     if let Some(rc) = unsafe { comp.GetRange() }.ok().and_then(|r| self.text_rect(ec, &r)) {
@@ -265,10 +254,6 @@ impl EditSession {
                 }
             }
         }
-        self.result.set(match &self.action {
-            Action::CheckScope => self.result.get(),
-            _ => true,
-        });
         Ok(())
     }
 }

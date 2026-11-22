@@ -43,6 +43,7 @@ use super::client::EngineClient;
 use super::edit::{Action, EditSession};
 use super::keys::{self, ShiftTracker};
 use super::{candwin, debug, guard};
+use crate::fields::Kind;
 use crate::gate::{self, KeyGate};
 use crate::screen;
 
@@ -67,6 +68,14 @@ struct State {
     ctx_marks: Vec<CtxMark>,
     /// 全屏游戏里按 Shift 临时打开了中文
     game_chinese: bool,
+    /// 输入框类型（密码框、隐私输入框……）的检查结果：同一个输入框短时间内不重复查
+    field_cache: Option<FieldCheck>,
+    /// 现在在密码框里：诊断日志连"按了退格、回车"都不记（免得看出密码有几位）
+    secret_box: bool,
+    /// 上一次写进诊断日志的"不打中文"原因（同一个原因不重复记，免得一个键一行）
+    last_block_log: Option<&'static str>,
+    /// 已经告诉引擎的"隐私输入框"状态，和那时是第几次连上引擎
+    told_private: Option<(bool, u64)>,
     /// 上一次中英切换的时间：系统的"单按 Shift"和自己的检测可能都报一次，只切一次
     last_toggle: Option<Instant>,
     preserved: bool,
@@ -93,6 +102,15 @@ const PENDING: Duration = Duration::from_secs(2);
 
 /// "这里开始不了输入"记多久（换了输入框也会忘掉）
 const DEAD_FOR: Duration = Duration::from_secs(60);
+
+/// 输入框类型查一次管多久（换了输入框马上重查）
+const FIELD_TTL: Duration = Duration::from_secs(1);
+
+struct FieldCheck {
+    ctx: ITfContext,
+    kind: Kind,
+    at: Instant,
+}
 
 struct CtxMark {
     ctx: ITfContext,
@@ -121,7 +139,7 @@ fn mark_ctx(st: &mut State, ctx: &ITfContext, good: bool) {
 }
 
 /// 诊断日志：只记不会打出字的键（空格、回车、方向键……），绝不记打的字。
-fn log_key(vk: u32, what: &str, eaten: bool) {
+fn write_key_log(vk: u32, what: &str, eaten: bool) {
     if debug::enabled() {
         if let Some(name) = gate::key_label(vk) {
             debug::log(&format!("{what} {name}：{}", if eaten { "输入法用了" } else { "交给程序" }));
@@ -137,8 +155,8 @@ pub struct Edited {
     pub accepted: bool,
     /// 请求本身就出错了（输入框已经不在了之类）
     pub error: bool,
-    /// 只读检查的结果
-    pub result: bool,
+    /// 输入框类型检查的结果
+    pub kind: Kind,
 }
 
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfThreadMgrEventSink, ITfCompositionSink)]
@@ -306,7 +324,7 @@ impl TextService_Impl {
             ran: es.ran.get(),
             accepted: r.as_ref().is_ok_and(|hr| hr.is_ok()),
             error: r.is_err(),
-            result: es.result.get(),
+            kind: es.kind.get(),
         }
     }
 
@@ -323,11 +341,12 @@ impl TextService_Impl {
         candwin::hide();
     }
 
-    /// 这个输入框里输入法该不该工作：不该的话说出原因（给诊断日志）。
-    fn block_reason(&self, ctx: &ITfContext) -> Option<&'static str> {
+    /// 这个输入框是哪一种：能正常打字、隐私输入框（打字但不记），还是输入法不该碰（原因给诊断日志）。
+    /// 全在这个程序里判断，不问引擎。
+    fn field(&self, ctx: &ITfContext) -> Kind {
         // 刚试过，这里开始不了输入
         if self.ctx_dead(ctx) {
-            return Some("刚试过这里开始不了输入");
+            return Kind::Off("刚试过这里开始不了输入");
         }
         unsafe {
             // 程序或用户关掉了输入法（Ctrl+空格、ImmSetOpenStatus）
@@ -335,7 +354,7 @@ impl TextService_Impl {
             if let Some(tm) = tm {
                 if let Ok(m) = tm.cast::<ITfCompartmentMgr>() {
                     if compartment(&m, &GUID_COMPARTMENT_KEYBOARD_OPENCLOSE) == Some(0) {
-                        return Some("输入法被关掉了（Ctrl+空格 或程序关的）");
+                        return Kind::Off("输入法被关掉了（Ctrl+空格 或程序关的）");
                     }
                 }
             }
@@ -343,25 +362,67 @@ impl TextService_Impl {
             if let Ok(m) = ctx.cast::<ITfCompartmentMgr>() {
                 for g in [GUID_COMPARTMENT_KEYBOARD_DISABLED, GUID_COMPARTMENT_EMPTYCONTEXT] {
                     if compartment(&m, &g).is_some_and(|v| v != 0) {
-                        return Some("程序在这里禁用了输入法");
+                        return Kind::Off("程序在这里禁用了输入法");
                     }
                 }
             }
             if let Ok(s) = ctx.GetStatus() {
                 if s.dwDynamicFlags & TS_SD_READONLY != 0 {
-                    return Some("只读");
+                    return Kind::Off("只读");
                 }
             }
         }
-        // 密码框、数字框；连读一下都不行的（输入框已经没了）
+        // 输入框声明的类型：密码框、数字框、隐私输入框（同一个输入框短时间内用上次的结果）
+        {
+            let st = self.st.borrow();
+            if let Some(c) = st.field_cache.as_ref().filter(|c| same_ctx(&c.ctx, ctx) && c.at.elapsed() < FIELD_TTL) {
+                return c.kind;
+            }
+        }
         let e = self.edit(ctx, Action::CheckScope, true);
-        if e.error {
-            return Some("读不了这个输入框");
+        let kind = if e.error { Kind::Off("读不了这个输入框（已经没了）") } else { e.kind };
+        // 程序这会儿不让读（没执行）：不记，下一个键再查
+        if e.ran || e.error {
+            self.st.borrow_mut().field_cache = Some(FieldCheck { ctx: ctx.clone(), kind, at: Instant::now() });
         }
-        if e.ran && e.result {
-            return Some("密码框或数字框");
+        kind
+    }
+
+    /// 告诉引擎现在是不是隐私输入框（状态变了、或者重新连上了引擎才发）。返回引擎知道了没有。
+    fn tell_private(&self, on: bool) -> bool {
+        let up_to_date = {
+            let st = self.st.borrow();
+            st.client.connected() && st.told_private == Some((on, st.client.generation()))
+        };
+        if up_to_date {
+            return true;
         }
-        None
+        if let Some(Reply::Ok) = self.call(&Request::SetPrivate { on }) {
+            let mut st = self.st.borrow_mut();
+            let g = st.client.generation();
+            st.told_private = Some((on, g));
+            if on {
+                debug::log("隐私输入框（无痕窗口等）：照常打字，什么都不记");
+            }
+            return true;
+        }
+        false
+    }
+
+    /// 按键写进诊断日志（密码框里连退格、回车都不记）。
+    fn log_key(&self, vk: u32, what: &str, eaten: bool) {
+        if !self.st.borrow().secret_box {
+            write_key_log(vk, what, eaten);
+        }
+    }
+
+    /// "不打中文"的原因写进诊断日志：同一个原因只记一次（免得每个键一行，看出打了几个字）。
+    fn log_block(&self, why: &'static str) {
+        let new = self.st.borrow().last_block_log != Some(why);
+        if new {
+            self.st.borrow_mut().last_block_log = Some(why);
+            debug::log(&format!("不打中文：{why}"));
+        }
     }
 
     /// 全屏游戏：打字的这个窗口铺满了它所在的屏幕，又不是真正的文字输入框（见 screen.rs）。
@@ -415,9 +476,6 @@ impl TextService_Impl {
         let Some(key) = keys::translate(vk, lp) else { return false };
         let mods = keys::mods();
         let composing = self.composing();
-        if !composing {
-            self.drop_hidden_input();
-        }
         if composing {
             // 打到一半按了快捷键（Ctrl+S、Alt+Tab……）：先把打的字母原样上屏，再把快捷键交给程序。
             // 在这里就做完，不等 OnKeyDown：按键一旦说了"要"，老式程序就收不到原来的键了
@@ -430,26 +488,39 @@ impl TextService_Impl {
                 }
                 return false;
             }
-        } else if keys::is_numpad(vk) {
-            self.pass_through(key, mods);
-            return false;
+        } else {
+            // 先在这个程序里看这里该不该打字。不该的话，这个键一个字都不发给引擎：
+            // 密码框里打的字绝不离开这个程序
+            let kind = self.field(&ctx);
+            self.st.borrow_mut().secret_box = kind == Kind::Secret;
+            match kind {
+                Kind::Secret => {
+                    self.log_block("密码框或 PIN");
+                    return false;
+                }
+                Kind::Off(why) => {
+                    self.log_block(why);
+                    return false;
+                }
+                Kind::Normal | Kind::Private => {}
+            }
+            if self.in_game(&ctx) && !self.st.borrow().game_chinese {
+                self.log_block("全屏游戏里（单按 Shift 临时打开中文）");
+                return false;
+            }
+            self.st.borrow_mut().last_block_log = None;
+            // 隐私输入框：引擎先得知道"这里什么都不记"，不然不打中文
+            if !self.tell_private(kind == Kind::Private) {
+                return false;
+            }
+            self.drop_hidden_input();
+            if keys::is_numpad(vk) {
+                self.pass_through(key, mods);
+                return false;
+            }
         }
         match self.call(&Request::TestKey { key, mods }) {
-            Some(Reply::Bool(true)) => {
-                if composing {
-                    return true;
-                }
-                // 要开始打一段新的拼音：先看这里该不该打
-                if let Some(why) = self.block_reason(&ctx) {
-                    debug::log(&format!("不打中文：{why}"));
-                    return false;
-                }
-                if self.in_game(&ctx) && !self.st.borrow().game_chinese {
-                    debug::log("不打中文：全屏游戏里（单按 Shift 临时打开中文）");
-                    return false;
-                }
-                true
-            }
+            Some(Reply::Bool(true)) => true,
             Some(Reply::Bool(false)) => {
                 if composing {
                     // 屏幕上还有拼音，引擎却不接这个键了（引擎重启过、别的程序里切成了纯英文）：
@@ -528,7 +599,7 @@ impl TextService_Impl {
         }
         let eat = self.decide_down(ctx, vk, lp);
         self.st.borrow_mut().gate.tested_down(vk, lp, eat, now);
-        log_key(vk, "按下（问）", eat);
+        self.log_key(vk, "按下（问）", eat);
         eat
     }
 
@@ -542,7 +613,7 @@ impl TextService_Impl {
         let eaten = eat && self.key_down(ctx, vk, lp);
         self.st.borrow_mut().gate.finished_down(vk, eaten);
         if cached.is_none() || eaten != eat {
-            log_key(vk, "按下", eaten);
+            self.log_key(vk, "按下", eaten);
         }
         eaten
     }
@@ -555,7 +626,7 @@ impl TextService_Impl {
         }
         let eat = self.decide_up(ctx, vk);
         self.st.borrow_mut().gate.tested_up(vk, eat, now);
-        log_key(vk, "松开（问）", eat);
+        self.log_key(vk, "松开（问）", eat);
         eat
     }
 
@@ -566,7 +637,7 @@ impl TextService_Impl {
             Some(eat) => eat,
             None => {
                 let eat = self.decide_up(ctx, vk);
-                log_key(vk, "松开", eat);
+                self.log_key(vk, "松开", eat);
                 eat
             }
         }
@@ -666,8 +737,11 @@ impl TextService_Impl {
         st.game_chinese = false;
         st.gate.clear();
         st.start_pending = None;
-        // 换了地方："开始不了输入"的记录作废，回来时再试一次
+        // 换了地方："开始不了输入"的记录作废，回来时再试一次；输入框类型重新查
         st.ctx_marks.retain(|m| m.good);
+        st.field_cache = None;
+        st.secret_box = false;
+        st.last_block_log = None;
     }
 }
 
@@ -717,6 +791,9 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
                 st.gate.clear();
                 st.ctx_marks.clear();
                 st.start_pending = None;
+                st.field_cache = None;
+                st.secret_box = false;
+                st.told_private = None;
                 Ok(())
             },
             Ok(()),

@@ -217,7 +217,8 @@ fn exe_dir() -> std::path::PathBuf {
 
 /// 连上引擎（等 `timeout_ms`）。
 fn engine(timeout_ms: u32) -> Option<pinyin_winpipe::PipeConn> {
-    let mut c = pinyin_winpipe::connect(timeout_ms).ok()?;
+    // 只连安装目录里的那个引擎（别的程序冒充的不连）
+    let mut c = pinyin_winpipe::connect(timeout_ms, &exe_dir().join("pinyin-engine.exe")).ok()?;
     let pid = std::process::id();
     match pinyin_ipc::call(&mut c, &Request::Hello { proto: PROTO, pid }) {
         Ok(Reply::Hello { proto }) if proto == PROTO => Some(c),

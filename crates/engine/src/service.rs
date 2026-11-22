@@ -91,6 +91,14 @@ impl Service {
                 s.clear_context();
                 Reply::Ok
             }
+            Request::SetPrivate { on } => {
+                if on != s.is_private() {
+                    // 进出隐私输入框：两边的上文不连着
+                    s.clear_context();
+                }
+                s.set_private(on);
+                Reply::Ok
+            }
         }
     }
 }
