@@ -9,7 +9,8 @@
 //!   不会出现"屏幕上什么都没有，空格、方向键却被输入法拿走"
 //! - 下面这些情况所有键原样交给程序：没有输入框、只读、密码框、数字框、程序关掉了输入法、
 //!   引擎没运行或卡住（超过 0.3 秒）
-//! - 全屏游戏里默认不打字（按键全交给游戏）；单按一下 Shift 才临时打中文，回车或 Esc 发出去后自动恢复
+//! - 全屏游戏里默认不打字（按键全交给游戏）；单按一下 Shift 才临时打中文，回车或 Esc 发出去后自动恢复。
+//!   "全屏"只看正在打字的这个窗口自己有没有铺满它所在的屏幕（见 screen.rs），接了副屏也不会互相影响
 //! - 任何出错都兜住，绝不让程序崩溃
 
 use std::cell::RefCell;
@@ -18,19 +19,22 @@ use std::time::{Duration, Instant};
 use pinyin_ipc::{Reply, Request};
 use pinyin_types::{Key, Mods, View};
 use windows::core::{implement, ComObject, IUnknownImpl, Interface, Ref, Result, BOOL, GUID};
-use windows::Win32::Foundation::{LPARAM, WPARAM};
+use windows::Win32::Foundation::{LPARAM, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONULL};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::System::Variant::VARIANT;
-use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN};
+use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows::Win32::UI::TextServices::{
     ITfCompartmentMgr, ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfDocumentMgr,
     ITfEditSession, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfSource, ITfTextInputProcessorEx,
     ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl, ITfThreadMgr, ITfThreadMgrEventSink,
     ITfThreadMgrEventSink_Impl, GUID_COMPARTMENT_EMPTYCONTEXT, GUID_COMPARTMENT_KEYBOARD_DISABLED,
-    GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, TF_ES_ASYNCDONTCARE, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC, TS_SD_READONLY,
-    TS_SS_TRANSITORY,
+    GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, TF_ES_ASYNCDONTCARE, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC,
+    TS_SD_INPUTPANEMANUALDISPLAYENABLE, TS_SD_READONLY, TS_SS_TRANSITORY,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetGUIThreadInfo, GUITHREADINFO};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetAncestor, GetGUIThreadInfo, GetWindowRect, IsIconic, IsWindowVisible, IsZoomed, GA_ROOT, GUITHREADINFO,
+};
 
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT;
 use windows::Win32::UI::TextServices::{TF_MOD_ON_KEYUP, TF_MOD_SHIFT, TF_PRESERVEDKEY};
@@ -40,6 +44,7 @@ use super::edit::{Action, EditSession};
 use super::keys::{self, ShiftTracker};
 use super::{candwin, debug, guard};
 use crate::gate::{self, KeyGate};
+use crate::screen;
 
 #[derive(Default)]
 struct State {
@@ -248,6 +253,39 @@ fn has_system_caret() -> bool {
     }
 }
 
+fn to_rect(r: RECT) -> screen::Rect {
+    screen::Rect::new(r.left, r.top, r.right, r.bottom)
+}
+
+/// 正在打字的这个窗口（最外层那个）是不是铺满了它自己所在的那块屏幕。
+/// 只看这一个窗口：别的屏幕上有没有全屏程序和这里无关。
+fn window_fills_screen(ctx: &ITfContext) -> bool {
+    unsafe {
+        let hwnd =
+            ctx.GetActiveView().and_then(|v| v.GetWnd()).ok().filter(|h| !h.is_invalid()).unwrap_or_else(|| GetFocus());
+        if hwnd.is_invalid() {
+            return false;
+        }
+        let root = GetAncestor(hwnd, GA_ROOT);
+        if root.is_invalid() || !IsWindowVisible(root).as_bool() || IsIconic(root).as_bool() {
+            return false;
+        }
+        let mut wr = RECT::default();
+        if GetWindowRect(root, &mut wr).is_err() {
+            return false;
+        }
+        let mon = MonitorFromWindow(root, MONITOR_DEFAULTTONULL);
+        if mon.is_invalid() {
+            return false;
+        }
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(mon, &mut mi).as_bool() {
+            return false;
+        }
+        screen::fills_screen(to_rect(wr), to_rect(mi.rcMonitor), IsZoomed(root).as_bool())
+    }
+}
+
 impl TextService_Impl {
     fn edit(&self, ctx: &ITfContext, action: Action, sync: bool) -> Edited {
         let tid = self.tid();
@@ -285,11 +323,11 @@ impl TextService_Impl {
         candwin::hide();
     }
 
-    /// 这个输入框里输入法该不该工作。
-    fn blocked(&self, ctx: &ITfContext) -> bool {
+    /// 这个输入框里输入法该不该工作：不该的话说出原因（给诊断日志）。
+    fn block_reason(&self, ctx: &ITfContext) -> Option<&'static str> {
         // 刚试过，这里开始不了输入
         if self.ctx_dead(ctx) {
-            return true;
+            return Some("刚试过这里开始不了输入");
         }
         unsafe {
             // 程序或用户关掉了输入法（Ctrl+空格、ImmSetOpenStatus）
@@ -297,7 +335,7 @@ impl TextService_Impl {
             if let Some(tm) = tm {
                 if let Ok(m) = tm.cast::<ITfCompartmentMgr>() {
                     if compartment(&m, &GUID_COMPARTMENT_KEYBOARD_OPENCLOSE) == Some(0) {
-                        return true;
+                        return Some("输入法被关掉了（Ctrl+空格 或程序关的）");
                     }
                 }
             }
@@ -305,30 +343,46 @@ impl TextService_Impl {
             if let Ok(m) = ctx.cast::<ITfCompartmentMgr>() {
                 for g in [GUID_COMPARTMENT_KEYBOARD_DISABLED, GUID_COMPARTMENT_EMPTYCONTEXT] {
                     if compartment(&m, &g).is_some_and(|v| v != 0) {
-                        return true;
+                        return Some("程序在这里禁用了输入法");
                     }
                 }
             }
             if let Ok(s) = ctx.GetStatus() {
                 if s.dwDynamicFlags & TS_SD_READONLY != 0 {
-                    return true;
+                    return Some("只读");
                 }
             }
         }
         // 密码框、数字框；连读一下都不行的（输入框已经没了）
         let e = self.edit(ctx, Action::CheckScope, true);
-        e.error || (e.ran && e.result)
+        if e.error {
+            return Some("读不了这个输入框");
+        }
+        if e.ran && e.result {
+            return Some("密码框或数字框");
+        }
+        None
     }
 
-    /// 全屏游戏：全屏，又不是真正的文字输入框（没有光标的老式窗口）。
+    /// 全屏游戏：打字的这个窗口铺满了它所在的屏幕，又不是真正的文字输入框（见 screen.rs）。
     fn in_game(&self, ctx: &ITfContext) -> bool {
-        let fullscreen = unsafe { SHQueryUserNotificationState() }
-            .is_ok_and(|s| s == QUNS_RUNNING_D3D_FULL_SCREEN || s == QUNS_BUSY);
-        if !fullscreen {
+        let status = unsafe { ctx.GetStatus() }.ok();
+        let transitory = status.is_some_and(|s| s.dwStaticFlags & TS_SS_TRANSITORY != 0);
+        let app_text_box = status.is_some_and(|s| s.dwDynamicFlags & TS_SD_INPUTPANEMANUALDISPLAYENABLE != 0);
+        // 便宜的先看：大多数输入框到这里就知道不是游戏了
+        if !transitory || app_text_box {
             return false;
         }
-        let transitory = unsafe { ctx.GetStatus() }.is_ok_and(|s| s.dwStaticFlags & TS_SS_TRANSITORY != 0);
-        transitory && !has_system_caret()
+        let caret = has_system_caret();
+        if caret {
+            return false;
+        }
+        screen::looks_like_game(screen::Signals {
+            fills_screen: window_fills_screen(ctx),
+            transitory,
+            app_text_box,
+            caret,
+        })
     }
 
     /// 引擎里有拼音、屏幕上却没有（开始输入失败了，或者程序一直没执行我们的请求）：清掉。
@@ -386,10 +440,12 @@ impl TextService_Impl {
                     return true;
                 }
                 // 要开始打一段新的拼音：先看这里该不该打
-                if self.blocked(&ctx) {
+                if let Some(why) = self.block_reason(&ctx) {
+                    debug::log(&format!("不打中文：{why}"));
                     return false;
                 }
                 if self.in_game(&ctx) && !self.st.borrow().game_chinese {
+                    debug::log("不打中文：全屏游戏里（单按 Shift 临时打开中文）");
                     return false;
                 }
                 true
@@ -584,6 +640,11 @@ impl TextService_Impl {
             Some((_, commit, view)) => {
                 debug::log(&format!("切换成 {}", if view.english_mode { "纯英文" } else { "中文" }));
                 let flash = if view.english_mode { "英" } else { "中" };
+                if let (false, Some(ctx)) = (view.english_mode, &ctx) {
+                    // 切到了中文：说明想在这里打中文。之前记下的"这里开始不了输入"作废，下一个键重新试，
+                    // 免得屏幕上闪了"中"，打出来却还是英文
+                    self.st.borrow_mut().ctx_marks.retain(|m| m.good || !same_ctx(&m.ctx, ctx));
+                }
                 if let Some(ctx) = &ctx {
                     self.edit(ctx, Action::Update { commit, view, flash: Some(flash) }, false);
                 }
