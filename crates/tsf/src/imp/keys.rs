@@ -1,9 +1,11 @@
 //! 把 Windows 的虚拟键码翻译成引擎的按键；识别"单独按一下 Shift"。
 
 use std::cell::Cell;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use pinyin_types::{Key, Mods};
+
+use crate::shift::ShiftTap;
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -100,18 +102,15 @@ pub fn translate(vk: u32, lparam: isize) -> Option<Key> {
     Some(k)
 }
 
-/// 单独按一下 Shift：按下到松开不超过 0.8 秒，中间没有按别的键，也没有点鼠标。
-/// Shift+点鼠标选文字、按住 Shift 很久、Shift+别的键（包括 Ctrl+Shift、Alt+Shift 切换输入法）都不算。
+/// 单独按一下 Shift（规则见 shift.rs）：每一次真实的按键都算，连按多快都行；
+/// 同一次松开系统和按键接口各报一次时只切一次。
 ///
 /// 点鼠标用一个只看本线程的鼠标钩子检测（Shift 按着时才装，松开就拆）。
 #[derive(Default)]
 pub struct ShiftTracker {
-    down_at: Option<Instant>,
-    spoiled: bool,
+    tap: ShiftTap,
     hook: Option<HHOOK>,
 }
-
-const TAP: Duration = Duration::from_millis(800);
 
 thread_local! {
     static CLICKED: Cell<bool> = const { Cell::new(false) };
@@ -147,12 +146,10 @@ fn any_mouse_button_down() -> bool {
 impl ShiftTracker {
     /// `repeat`：按住不放时系统重复发的"按下"（lParam 第 30 位）。
     pub fn shift_down(&mut self, repeat: bool) {
-        if repeat && self.down_at.is_some() {
+        if repeat && self.tap.held() {
             return;
         }
-        // 新的一次按下：不管上一次的松开有没有收到（比如按着 Shift 切了窗口），都重新开始
-        self.down_at = Some(Instant::now());
-        self.spoiled = any_mouse_button_down();
+        self.tap.down(repeat, any_mouse_button_down(), Instant::now());
         CLICKED.with(|c| c.set(false));
         if self.hook.is_none() {
             self.hook = unsafe { SetWindowsHookExW(WH_MOUSE, Some(mouse_hook), None, GetCurrentThreadId()) }.ok();
@@ -160,9 +157,7 @@ impl ShiftTracker {
     }
 
     pub fn other_key(&mut self) {
-        if self.down_at.is_some() {
-            self.spoiled = true;
-        }
+        self.tap.spoil();
     }
 
     fn unhook(&mut self) {
@@ -173,38 +168,39 @@ impl ShiftTracker {
         }
     }
 
-    /// 现在松开的话算不算"单独按一下"。没见过这次按下返回 None。
-    pub fn preview(&self) -> Option<bool> {
-        let t = self.down_at?;
-        let clicked = CLICKED.with(|c| c.get());
-        Some(!self.spoiled && !clicked && !any_mouse_button_down() && t.elapsed() <= TAP)
+    /// 按着的时候点过鼠标：这次不算单按
+    fn note_click(&mut self) {
+        if CLICKED.with(|c| c.replace(false)) {
+            self.tap.spoil();
+        }
     }
 
-    /// Shift 松开：是不是一次"单独按一下"。
-    pub fn shift_up(&mut self) -> bool {
-        let tap = self.preview().unwrap_or(false);
-        self.down_at = None;
-        self.spoiled = false;
+    /// 按键接口报 Shift 松开：要不要切换中英。
+    pub fn key_up(&mut self) -> bool {
+        self.note_click();
+        let r = self.tap.key_up(any_mouse_button_down(), Instant::now());
         self.unhook();
-        tap
+        r
+    }
+
+    /// 系统的保留键检测报"单独按了一下 Shift"：要不要切换中英。
+    pub fn preserved(&mut self) -> bool {
+        self.note_click();
+        let r = self.tap.preserved(any_mouse_button_down(), Instant::now());
+        self.unhook();
+        r
     }
 
     /// 停用输入法时拆掉钩子。
     pub fn reset(&mut self) {
-        self.down_at = None;
-        self.spoiled = false;
+        self.tap.reset();
+        CLICKED.with(|c| c.set(false));
         self.unhook();
     }
 
     /// 给诊断日志用
     pub fn describe(&self) -> String {
-        format!(
-            "见过按下={} 按了别的键={} 点了鼠标={} 按了{}毫秒",
-            self.down_at.is_some(),
-            self.spoiled,
-            CLICKED.with(|c| c.get()),
-            self.down_at.map(|t| t.elapsed().as_millis()).unwrap_or(0)
-        )
+        format!("{} 点了鼠标={}", self.tap.describe(Instant::now()), CLICKED.with(|c| c.get()))
     }
 }
 

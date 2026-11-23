@@ -14,6 +14,7 @@ pub mod gate;
 #[cfg(windows)]
 mod imp;
 pub mod screen;
+pub mod shift;
 
 /// COM 入口（系统通过它们使用输入法）；导出给 Windows 自动测试用。
 #[cfg(windows)]

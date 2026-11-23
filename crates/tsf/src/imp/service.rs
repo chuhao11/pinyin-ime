@@ -76,8 +76,6 @@ struct State {
     last_block_log: Option<&'static str>,
     /// 已经告诉引擎的"隐私输入框"状态，和那时是第几次连上引擎
     told_private: Option<(bool, u64)>,
-    /// 上一次中英切换的时间：系统的"单按 Shift"和自己的检测可能都报一次，只切一次
-    last_toggle: Option<Instant>,
     preserved: bool,
 }
 
@@ -93,9 +91,6 @@ fn preserved_keys() -> [(GUID, TF_PRESERVEDKEY); 2] {
         (PRESERVE_SHIFT2, TF_PRESERVEDKEY { uVKey: vk, uModifiers: TF_MOD_ON_KEYUP }),
     ]
 }
-
-/// 两次报告之间不超过这么久，算同一次按键
-const SAME_TAP: Duration = Duration::from_millis(400);
 
 /// 排队的"开始输入"请求最多等这么久，还没执行就当作失败
 const PENDING: Duration = Duration::from_secs(2);
@@ -666,11 +661,10 @@ impl TextService_Impl {
             let (desc, tap) = {
                 let mut st = self.st.borrow_mut();
                 let d = st.shift.describe();
-                (d, st.shift.shift_up())
+                (d, st.shift.key_up())
             };
-            let dup = self.recently_toggled();
-            debug::log(&format!("Shift 松开（按键接口）：{desc} → 算单按={tap} 刚切过={dup}"));
-            if tap && !dup {
+            debug::log(&format!("Shift 松开（按键接口）：{desc} → 切换={tap}"));
+            if tap {
                 self.shift_tap(ctx);
             }
             // Shift 松开永远交给程序
@@ -679,35 +673,21 @@ impl TextService_Impl {
         self.st.borrow_mut().gate.decide_up(vk)
     }
 
-    fn recently_toggled(&self) -> bool {
-        self.st.borrow().last_toggle.is_some_and(|t| t.elapsed() < SAME_TAP)
-    }
-
-    /// 系统报告"单独按了一下 Shift"（保留键）。
+    /// 系统报告"单独按了一下 Shift"（保留键）。同一次松开按键接口可能也报，只切一次（见 shift.rs）。
     fn preserved_shift(&self, ctx: Option<ITfContext>) {
-        if self.recently_toggled() {
-            debug::log("Shift 松开（系统保留键）：刚切过，忽略");
-            return;
-        }
-        let (desc, preview) = {
+        let (desc, tap) = {
             let mut st = self.st.borrow_mut();
             let d = st.shift.describe();
-            let p = st.shift.preview();
-            // 这次按键由这里处理了：之后按键接口再报松开，不再算
-            st.shift.reset();
-            (d, p)
+            (d, st.shift.preserved())
         };
-        debug::log(&format!("Shift 松开（系统保留键）：{desc}"));
-        // 自己的检测看到了这次按下，而且看到中间点了鼠标或按了别的键：不算
-        if preview == Some(false) {
-            return;
+        debug::log(&format!("Shift 松开（系统保留键）：{desc} → 切换={tap}"));
+        if tap {
+            self.shift_tap(ctx);
         }
-        self.shift_tap(ctx);
     }
 
     /// 单按一下 Shift：中文 ↔ 纯英文；在光标旁边闪一下"中"或"英"。
     fn shift_tap(&self, ctx: Option<ITfContext>) {
-        self.st.borrow_mut().last_toggle = Some(Instant::now());
         let composing = self.composing();
         // 输入法被"关上"了（开机时系统有时这样，也可能是 Ctrl+空格 或程序关的）：这时打出来本来就是英文，
         // 单按 Shift 就是要中文。把它打开、切到中文——不然屏幕上闪了"中"，打出来却还是英文
